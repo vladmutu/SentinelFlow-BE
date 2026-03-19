@@ -15,6 +15,6 @@ AsyncSessionLocal = async_sessionmaker(
 )
 
 
-async def get_db_session() -> AsyncSession:
+async def get_db() -> AsyncSession:
     async with AsyncSessionLocal() as session:
         yield session
