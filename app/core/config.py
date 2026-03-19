@@ -31,6 +31,9 @@ class Settings(BaseSettings):
         alias="GITHUB_REDIRECT_URI",
     )
 
+    github_app_id: int = Field(alias="GITHUB_APP_ID")
+    github_app_private_key: str = Field(alias="GITHUB_APP_PRIVATE_KEY")
+
     jwt_secret_key: str = Field(default="change-me-in-env", alias="JWT_SECRET_KEY")
     jwt_algorithm: str = Field(default="HS256", alias="JWT_ALGORITHM")
     jwt_expire_minutes: int = Field(default=60, alias="JWT_EXPIRE_MINUTES")

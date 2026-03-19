@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+import logging
 from urllib.parse import urlencode
 
 import httpx
@@ -8,12 +9,25 @@ from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.deps import get_current_user
 from app.core.config import settings
 from app.core.security import create_access_token
 from app.db.session import get_db
 from app.models.user import User
 
+print("!!! AUTH ROUTER LOADED !!!")
+
 router = APIRouter(prefix="/api/auth", tags=["Auth"])
+logger = logging.getLogger(__name__)
+
+
+@router.get("/me")
+async def get_me(current_user: User = Depends(get_current_user)) -> dict[str, str | None]:
+    return {
+        "username": current_user.username,
+        "email": current_user.email,
+        "avatar_url": current_user.avatar_url,
+    }
 
 
 @router.get("/github/login")
@@ -46,20 +60,41 @@ async def github_callback(
             detail="GitHub OAuth is not configured",
         )
 
+    print(f"DEBUG: Using Client ID: '{settings.github_client_id}'")
+    print(f"DEBUG: Client ID Length: {len(settings.github_client_id)}")
+    if not settings.github_client_id:
+        raise SystemExit("GITHUB_CLIENT_ID is empty; stopping server.")
+
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
-            token_resp = await client.post(
-                "https://github.com/login/oauth/access_token",
-                headers={"Accept": "application/json"},
-                data={
-                    "client_id": settings.github_client_id,
-                    "client_secret": settings.github_client_secret,
-                    "code": code,
-                    "redirect_uri": settings.github_redirect_uri,
-                },
-            )
-            token_resp.raise_for_status()
-            token_payload = token_resp.json()
+            logger.info("GitHub OAuth exchange using client_id=%s", settings.github_client_id)
+            try:
+                response = await client.post(
+                    "https://github.com/login/oauth/access_token",
+                    headers={"Accept": "application/json"},
+                    data={
+                        "client_id": settings.github_client_id,
+                        "client_secret": settings.github_client_secret,
+                        "code": code,
+                    },
+                )
+            except httpx.RequestError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail="Unable to reach GitHub OAuth endpoints",
+                ) from exc
+
+            print(f"DEBUG: GitHub Response Status: {response.status_code}")
+            print(f"DEBUG: GitHub Response Body: {response.text}")
+            print(f"DEBUG: GitHub Raw Response: {response.text}")
+
+            if response.status_code != status.HTTP_200_OK:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"GitHub Error: {response.text}",
+                )
+
+            token_payload = response.json()
 
             access_token = token_payload.get("access_token")
             if not access_token:

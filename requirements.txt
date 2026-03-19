@@ -9,4 +9,5 @@ pydantic-settings==2.10.1
 python-dotenv==1.1.1
 httpx==0.28.1
 PyGithub==2.6.1
+PyJWT==2.9.0
 python-jose[cryptography]==3.3.0
