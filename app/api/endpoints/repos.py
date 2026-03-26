@@ -290,27 +290,62 @@ async def get_npm_dependency_tree(
     repo_name: str,
     current_user: User = Depends(get_current_user),
 ) -> dict:
-    _ = current_user
+    user_headers = {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {current_user.access_token}",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
 
     try:
         async with httpx.AsyncClient(timeout=20.0) as client:
-            installation_token = await _get_installation_token_for_repo(client, owner, repo_name)
-            installation_headers = {
-                "Accept": "application/vnd.github+json",
-                "Authorization": f"Bearer {installation_token}",
-                "X-GitHub-Api-Version": "2022-11-28",
-            }
+            installation_headers: dict[str, str] | None = None
+            try:
+                installation_token = await _get_installation_token_for_repo(client, owner, repo_name)
+                installation_headers = {
+                    "Accept": "application/vnd.github+json",
+                    "Authorization": f"Bearer {installation_token}",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                }
+            except HTTPException as exc:
+                if exc.status_code not in {
+                    status.HTTP_401_UNAUTHORIZED,
+                    status.HTTP_403_FORBIDDEN,
+                    status.HTTP_404_NOT_FOUND,
+                    status.HTTP_502_BAD_GATEWAY,
+                }:
+                    raise
+
+            active_headers = installation_headers or user_headers
 
             lockfile_resp = await client.get(
                 f"https://api.github.com/repos/{owner}/{repo_name}/contents/package-lock.json",
-                headers=installation_headers,
+                headers=active_headers,
             )
+
+            # Fall back to the user OAuth token if app token access is denied.
+            if installation_headers and lockfile_resp.status_code in {
+                status.HTTP_401_UNAUTHORIZED,
+                status.HTTP_403_FORBIDDEN,
+            }:
+                lockfile_resp = await client.get(
+                    f"https://api.github.com/repos/{owner}/{repo_name}/contents/package-lock.json",
+                    headers=user_headers,
+                )
 
             if lockfile_resp.status_code == status.HTTP_404_NOT_FOUND:
                 package_json_resp = await client.get(
                     f"https://api.github.com/repos/{owner}/{repo_name}/contents/package.json",
-                    headers=installation_headers,
+                    headers=active_headers,
                 )
+
+                if installation_headers and package_json_resp.status_code in {
+                    status.HTTP_401_UNAUTHORIZED,
+                    status.HTTP_403_FORBIDDEN,
+                }:
+                    package_json_resp = await client.get(
+                        f"https://api.github.com/repos/{owner}/{repo_name}/contents/package.json",
+                        headers=user_headers,
+                    )
 
                 if package_json_resp.status_code == status.HTTP_404_NOT_FOUND:
                     raise HTTPException(
