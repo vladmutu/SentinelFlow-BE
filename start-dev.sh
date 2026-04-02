@@ -16,16 +16,3 @@ fi
 echo "Spinning up PostgreSQL..."
 docker compose up -d --remove-orphans
 
-echo ""
-echo "Database is up and running!"
-echo ""
-echo "How to connect via your Windows pgAdmin:"
-echo "  - Host name/address: localhost"
-echo "  - Port:              5433"
-echo "  - Maintenance DB:    sentinel_core"
-echo "  - Username:          sentinel_admin"
-echo "  - Password:          supersecretpassword"
-echo ""
-echo "SQLAlchemy Connection String (for your .env file):"
-echo "  DATABASE_URL=postgresql+asyncpg://sentinel_admin:supersecretpassword@localhost:5433/sentinel_core"
-echo "========================================"
