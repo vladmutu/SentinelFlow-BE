@@ -128,3 +128,79 @@ async def list_repositories(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="Unable to reach GitHub API while fetching repositories",
         ) from exc
+
+
+@router.get("/{owner}/{repo_name}/dependencies/npm")
+async def get_npm_dependency_tree(
+    owner: str,
+    repo_name: str,
+    current_user: User = Depends(get_current_user),
+) -> dict:
+    _ = current_user
+
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            installation_token = await _get_installation_token_for_repo(client, owner, repo_name)
+            installation_headers = {
+                "Accept": "application/vnd.github+json",
+                "Authorization": f"Bearer {installation_token}",
+                "X-GitHub-Api-Version": "2022-11-28",
+            }
+
+            lockfile_resp = await client.get(
+                f"https://api.github.com/repos/{owner}/{repo_name}/contents/package-lock.json",
+                headers=installation_headers,
+            )
+
+            if lockfile_resp.status_code == status.HTTP_404_NOT_FOUND:
+                package_json_resp = await client.get(
+                    f"https://api.github.com/repos/{owner}/{repo_name}/contents/package.json",
+                    headers=installation_headers,
+                )
+
+                if package_json_resp.status_code == status.HTTP_404_NOT_FOUND:
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail="No NPM manifest files found.",
+                    )
+
+                if package_json_resp.is_error:
+                    raise HTTPException(
+                        status_code=status.HTTP_502_BAD_GATEWAY,
+                        detail=f"GitHub API error while fetching package.json: {package_json_resp.status_code}",
+                    )
+
+                package_json_content = _decode_github_content(package_json_resp.json())
+                package_json = json.loads(package_json_content)
+                if not isinstance(package_json, dict):
+                    raise HTTPException(
+                        status_code=status.HTTP_502_BAD_GATEWAY,
+                        detail="Invalid package.json format",
+                    )
+                return _build_tree_from_package_json(package_json)
+
+            if lockfile_resp.is_error:
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail=f"GitHub API error while fetching package-lock.json: {lockfile_resp.status_code}",
+                )
+
+            lockfile_content = _decode_github_content(lockfile_resp.json())
+            lockfile_json = json.loads(lockfile_content)
+            if not isinstance(lockfile_json, dict):
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail="Invalid package-lock.json format",
+                )
+            return _build_npm_tree_from_lockfile(lockfile_json)
+
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Unable to reach GitHub API while fetching NPM dependencies",
+        ) from exc
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Failed to parse NPM manifest JSON content",
+        ) from exc
