@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.endpoints.auth import router as auth_router
 from app.api.endpoints.repos import router as repos_router
+from app.api.endpoints.scan import router as scan_router
 from app.core.config import settings
 from app.db.session import get_db
 
@@ -27,6 +28,7 @@ def create_app() -> FastAPI:
 
     app.include_router(auth_router)
     app.include_router(repos_router, prefix="/api/repos")
+    app.include_router(scan_router, prefix="/api/repos")
 
     @app.get(f"{settings.api_v1_prefix}/health", tags=["Health"])
     async def health_check(db: AsyncSession = Depends(get_db)) -> dict[str, str]:

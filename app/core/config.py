@@ -38,6 +38,11 @@ class Settings(BaseSettings):
     jwt_algorithm: str = Field(default="HS256", alias="JWT_ALGORITHM")
     jwt_expire_minutes: int = Field(default=60, alias="JWT_EXPIRE_MINUTES")
 
+    # Scanner / malware-classification settings
+    scanner_concurrency: int = Field(default=10, alias="SCANNER_CONCURRENCY")
+    scanner_model_path: str = Field(default="malware_classifier.pkl", alias="SCANNER_MODEL_PATH")
+    scanner_threshold_path: str = Field(default="malware_threshold.pkl", alias="SCANNER_THRESHOLD_PATH")
+
 
 @lru_cache
 def get_settings() -> Settings:

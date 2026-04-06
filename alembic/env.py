@@ -8,6 +8,7 @@ from alembic import context
 from app.core.config import settings
 from app.models.base import Base
 from app.models.user import User
+from app.models.scan import ScanJob, ScanResult
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
@@ -26,6 +27,7 @@ target_metadata = Base.metadata
 
 # Keep an explicit model import for Alembic autogenerate discovery.
 _ = User
+_ = ScanJob, ScanResult
 
 
 def _get_alembic_database_url() -> str:
