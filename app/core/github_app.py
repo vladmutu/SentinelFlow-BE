@@ -6,6 +6,14 @@ from app.core.config import settings
 
 
 def get_app_jwt() -> str:
+    """Build a short-lived GitHub App JWT for installation-token requests.
+
+    Returns:
+        str: RS256-signed GitHub App JWT.
+
+    Raises:
+        ValueError: If required GitHub App credentials are missing.
+    """
     if settings.github_app_id <= 0 or not settings.github_app_private_key:
         raise ValueError("GitHub App credentials are not configured")
 

@@ -18,6 +18,7 @@ from typing import Any
 
 import joblib
 import numpy as np
+import pandas as pd
 
 from app.core.config import settings
 
@@ -28,6 +29,34 @@ SCANNER_VERSION = "1.0.0"
 # ── Lazy-loaded globals ────────────────────────────────────────────────
 _classifier: Any | None = None
 _threshold: float | None = None
+
+MODEL_FEATURE_COLUMNS: tuple[str, ...] = (
+    "max_entropy",
+    "avg_entropy",
+    "eval_count",
+    "exec_count",
+    "base64_count",
+    "network_imports",
+    "entropy_gap",
+    "exec_eval_ratio",
+    "network_exec_ratio",
+    "obfuscation_index",
+)
+
+
+def _resolve_threshold(artifact: Any) -> float:
+    """Normalize threshold artifact loaded from disk into a float.
+
+    Supports either a raw float or a dict such as
+    ``{"threshold": 0.42}``.
+    """
+    if isinstance(artifact, (int, float)):
+        return float(artifact)
+    if isinstance(artifact, dict) and "threshold" in artifact:
+        raw = artifact["threshold"]
+        if isinstance(raw, (int, float)):
+            return float(raw)
+    raise ValueError("Invalid threshold artifact; expected float or {'threshold': float}")
 
 
 def _ensure_model_loaded() -> None:
@@ -45,7 +74,7 @@ def _ensure_model_loaded() -> None:
         raise FileNotFoundError(f"Threshold file not found at {threshold_path}")
 
     _classifier = joblib.load(model_path)
-    _threshold = joblib.load(threshold_path)
+    _threshold = _resolve_threshold(joblib.load(threshold_path))
     logger.info("Loaded malware classifier from %s (threshold=%.4f)", model_path, _threshold)
 
 
@@ -59,60 +88,50 @@ class ScanVerdict:
     error_message: str | None = None
 
 
-def _extract_features_from_directory(package_dir: Path) -> np.ndarray:
-    """Extract feature vector from an extracted package directory.
+def _extract_features_from_directory(package_dir: Path) -> pd.DataFrame:
+    """Extract the 10-feature vector expected by the trained model.
 
-    This mirrors the feature-extraction pipeline the model was trained with.
-    It walks the package directory, reads source files, and computes the
-    features expected by the classifier.
+    The resulting frame has one row and columns matching the model schema
+    used in training:
+    ``max_entropy, avg_entropy, eval_count, exec_count, base64_count,
+    network_imports, entropy_gap, exec_eval_ratio, network_exec_ratio,
+    obfuscation_index``.
     """
-    features: dict[str, float] = {}
+    def _shannon_entropy(text: str) -> float:
+        if not text:
+            return 0.0
+        counts = np.fromiter((text.count(chr(i)) for i in range(256)), dtype=float)
+        probs = counts[counts > 0] / len(text)
+        return float(-(probs * np.log2(probs)).sum())
+
+    def _count_tokens(content: str, tokens: list[str]) -> float:
+        lowered = content.lower()
+        return float(sum(lowered.count(token.lower()) for token in tokens))
 
     all_files: list[Path] = []
     for root, _dirs, files in os.walk(package_dir):
         for fname in files:
             all_files.append(Path(root) / fname)
 
-    features["file_count"] = float(len(all_files))
+    source_files = [f for f in all_files if f.suffix.lower() in (".js", ".mjs", ".cjs", ".py")]
+    json_files = [f for f in all_files if f.suffix.lower() == ".json"]
 
-    js_files = [f for f in all_files if f.suffix in (".js", ".mjs", ".cjs")]
-    py_files = [f for f in all_files if f.suffix == ".py"]
-    json_files = [f for f in all_files if f.suffix == ".json"]
-
-    features["js_file_count"] = float(len(js_files))
-    features["py_file_count"] = float(len(py_files))
-    features["json_file_count"] = float(len(json_files))
-
-    total_size = 0
-    total_lines = 0
-    source_files = js_files + py_files
-
-    has_install_scripts = 0.0
-    has_network_calls = 0.0
-    has_obfuscation = 0.0
-    has_env_access = 0.0
-    has_exec_calls = 0.0
-    has_base64 = 0.0
-    has_preinstall = 0.0
-    has_postinstall = 0.0
-    max_line_length = 0.0
+    entropies: list[float] = []
+    eval_count = 0.0
+    exec_count = 0.0
+    base64_count = 0.0
+    network_imports = 0.0
 
     network_indicators = [
         "http://", "https://", "request(", "fetch(", "axios",
         "urllib", "requests.get", "requests.post", "socket",
         "XMLHttpRequest", "net.connect",
     ]
-    obfuscation_indicators = [
-        "\\x", "\\u00", "fromCharCode", "String.fromCharCode",
-        "eval(", "Function(", "charAt", "charCodeAt",
-    ]
+    eval_indicators = ["eval(", "function(", "function (", "fromcharcode"]
     exec_indicators = [
-        "exec(", "eval(", "subprocess", "child_process",
+        "exec(", "subprocess", "child_process",
         "os.system", "os.popen", "spawn(", "execSync",
         "__import__",
-    ]
-    env_indicators = [
-        "process.env", "os.environ", "os.getenv", "getenv",
     ]
     base64_indicators = [
         "atob(", "btoa(", "base64", "b64decode", "b64encode",
@@ -124,81 +143,50 @@ def _extract_features_from_directory(package_dir: Path) -> np.ndarray:
         except Exception:
             continue
 
-        total_size += len(content)
-        lines = content.splitlines()
-        total_lines += len(lines)
+        entropies.append(_shannon_entropy(content))
+        eval_count += _count_tokens(content, eval_indicators)
+        exec_count += _count_tokens(content, exec_indicators)
+        base64_count += _count_tokens(content, base64_indicators)
+        network_imports += _count_tokens(content, network_indicators)
 
-        for line in lines:
-            if len(line) > max_line_length:
-                max_line_length = float(len(line))
-
-        content_lower = content.lower()
-
-        for ind in network_indicators:
-            if ind.lower() in content_lower:
-                has_network_calls = 1.0
-                break
-        for ind in obfuscation_indicators:
-            if ind.lower() in content_lower:
-                has_obfuscation = 1.0
-                break
-        for ind in exec_indicators:
-            if ind.lower() in content_lower:
-                has_exec_calls = 1.0
-                break
-        for ind in env_indicators:
-            if ind.lower() in content_lower:
-                has_env_access = 1.0
-                break
-        for ind in base64_indicators:
-            if ind.lower() in content_lower:
-                has_base64 = 1.0
-                break
-
-    # Check for install scripts in package.json
+    # Include package.json text for script-related and encoded-content signals.
     for jf in json_files:
-        if jf.name == "package.json":
-            try:
-                import json
-                pkg = json.loads(jf.read_text(encoding="utf-8", errors="ignore"))
-                scripts = pkg.get("scripts", {})
-                if isinstance(scripts, dict):
-                    if "preinstall" in scripts:
-                        has_preinstall = 1.0
-                    if "postinstall" in scripts:
-                        has_postinstall = 1.0
-                    if "install" in scripts:
-                        has_install_scripts = 1.0
-            except Exception:
-                pass
+        try:
+            content = jf.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+        entropies.append(_shannon_entropy(content))
+        eval_count += _count_tokens(content, eval_indicators)
+        exec_count += _count_tokens(content, exec_indicators)
+        base64_count += _count_tokens(content, base64_indicators)
+        network_imports += _count_tokens(content, network_indicators)
 
-    # Check for setup.py install hooks in Python packages
-    for pf in py_files:
-        if pf.name == "setup.py":
-            try:
-                content = pf.read_text(encoding="utf-8", errors="ignore")
-                if "cmdclass" in content:
-                    has_install_scripts = 1.0
-            except Exception:
-                pass
+    max_entropy = float(max(entropies, default=0.0))
+    avg_entropy = float(np.mean(entropies) if entropies else 0.0)
+    entropy_gap = float(max_entropy - avg_entropy)
+    exec_eval_ratio = float((exec_count + 1.0) / (eval_count + 1.0))
+    network_exec_ratio = float((network_imports + 1.0) / (exec_count + 1.0))
+    obfuscation_index = float(entropy_gap * np.log1p(base64_count))
 
-    features["total_source_size"] = float(total_size)
-    features["total_source_lines"] = float(total_lines)
-    features["avg_line_length"] = float(total_size / max(total_lines, 1))
-    features["max_line_length"] = max_line_length
-    features["has_install_scripts"] = has_install_scripts
-    features["has_preinstall"] = has_preinstall
-    features["has_postinstall"] = has_postinstall
-    features["has_network_calls"] = has_network_calls
-    features["has_obfuscation"] = has_obfuscation
-    features["has_exec_calls"] = has_exec_calls
-    features["has_env_access"] = has_env_access
-    features["has_base64"] = has_base64
+    features: dict[str, float] = {
+        "max_entropy": max_entropy,
+        "avg_entropy": avg_entropy,
+        "eval_count": float(eval_count),
+        "exec_count": float(exec_count),
+        "base64_count": float(base64_count),
+        "network_imports": float(network_imports),
+        "entropy_gap": entropy_gap,
+        "exec_eval_ratio": exec_eval_ratio,
+        "network_exec_ratio": network_exec_ratio,
+        "obfuscation_index": obfuscation_index,
+    }
 
-    # Build the final feature vector in the order the model expects.
-    feature_names = sorted(features.keys())
-    vector = np.array([[features[fn] for fn in feature_names]])
-    return vector
+    expected_columns = list(
+        getattr(_classifier, "feature_names_in_", MODEL_FEATURE_COLUMNS)
+    )
+    # Keep only expected model features and preserve exact training order.
+    row = {col: float(features.get(col, 0.0)) for col in expected_columns}
+    return pd.DataFrame([row], columns=expected_columns)
 
 
 def _extract_archive(archive_path: Path, dest_dir: Path) -> Path:

@@ -1,5 +1,6 @@
 import base64
 import json
+import logging
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -8,11 +9,24 @@ from app.api.deps import get_current_user
 from app.core.config import settings
 from app.core.github_app import get_app_jwt
 from app.models.user import User
+from app.services import manifest_utils
 
 router = APIRouter(tags=["Repositories"])
+logger = logging.getLogger(__name__)
 
 
 def _decode_github_content(payload: dict) -> str:
+    """Decode GitHub Contents API payload content.
+
+    Args:
+        payload: Raw GitHub file-content response object.
+
+    Returns:
+        str: UTF-8 decoded file content.
+
+    Raises:
+        HTTPException: If payload content is missing or malformed.
+    """
     encoded = payload.get("content")
     if not isinstance(encoded, str):
         raise HTTPException(
@@ -24,6 +38,16 @@ def _decode_github_content(payload: dict) -> str:
 
 
 def _simplified_dep(name: str, version: str | None, children: list[dict] | None = None) -> dict:
+    """Build a normalized dependency-node representation.
+
+    Args:
+        name: Package name.
+        version: Package version.
+        children: Child dependency nodes.
+
+    Returns:
+        dict: Dependency node in the API response shape.
+    """
     return {
         "name": name,
         "version": version or "unknown",
@@ -32,6 +56,16 @@ def _simplified_dep(name: str, version: str | None, children: list[dict] | None 
 
 
 def _resolve_v1_tree(dep_name: str, dep_payload: dict, seen: set[str]) -> dict:
+    """Resolve one dependency subtree from lockfile v1 format.
+
+    Args:
+        dep_name: Dependency name.
+        dep_payload: Dependency payload from lockfile.
+        seen: Dependency names already traversed to avoid cycles.
+
+    Returns:
+        dict: Normalized dependency node with descendants.
+    """
     if dep_name in seen:
         return _simplified_dep(dep_name, dep_payload.get("version"))
 
@@ -50,6 +84,16 @@ def _resolve_v1_tree(dep_name: str, dep_payload: dict, seen: set[str]) -> dict:
 
 
 def _find_pkg_entry(packages: dict, dep_name: str, parent_path: str) -> tuple[str | None, dict | None]:
+    """Locate a dependency entry in lockfile v2 ``packages`` map.
+
+    Args:
+        packages: Lockfile ``packages`` mapping.
+        dep_name: Dependency name to find.
+        parent_path: Parent package path for nearest resolution.
+
+    Returns:
+        tuple[str | None, dict | None]: Resolved path and package entry.
+    """
     direct_path = f"{parent_path}/node_modules/{dep_name}" if parent_path else f"node_modules/{dep_name}"
     direct_entry = packages.get(direct_path)
     if isinstance(direct_entry, dict):
@@ -68,6 +112,17 @@ def _find_pkg_entry(packages: dict, dep_name: str, parent_path: str) -> tuple[st
 
 
 def _resolve_v2_tree(dep_name: str, packages: dict, parent_path: str, seen_paths: set[str]) -> dict:
+    """Resolve one dependency subtree from lockfile v2 format.
+
+    Args:
+        dep_name: Dependency name.
+        packages: Lockfile ``packages`` mapping.
+        parent_path: Parent package path used for closest lookup.
+        seen_paths: Package paths already traversed to avoid cycles.
+
+    Returns:
+        dict: Normalized dependency node with descendants.
+    """
     dep_path, dep_entry = _find_pkg_entry(packages, dep_name, parent_path)
     if dep_entry is None:
         return _simplified_dep(dep_name, None)
@@ -89,6 +144,14 @@ def _resolve_v2_tree(dep_name: str, packages: dict, parent_path: str, seen_paths
 
 
 def _build_npm_tree_from_lockfile(lockfile: dict) -> dict:
+    """Build a normalized dependency tree from package-lock content.
+
+    Args:
+        lockfile: Parsed ``package-lock.json`` payload.
+
+    Returns:
+        dict: Tree rooted at the project package.
+    """
     project_name = lockfile.get("name") or "project"
     project_version = lockfile.get("version") or "0.0.0"
 
@@ -122,6 +185,14 @@ def _build_npm_tree_from_lockfile(lockfile: dict) -> dict:
 
 
 def _build_tree_from_package_json(package_json: dict) -> dict:
+    """Build a shallow dependency tree from package.json only.
+
+    Args:
+        package_json: Parsed ``package.json`` payload.
+
+    Returns:
+        dict: Project root node with direct dependencies only.
+    """
     project_name = package_json.get("name") or "project"
     project_version = package_json.get("version") or "0.0.0"
     dependencies = package_json.get("dependencies", {})
@@ -135,7 +206,32 @@ def _build_tree_from_package_json(package_json: dict) -> dict:
     return _simplified_dep(str(project_name), str(project_version), children)
 
 
+async def _build_pypi_tree_from_manifest(client: httpx.AsyncClient, manifest: dict) -> dict:
+    """Build a normalized dependency tree from a synthetic PyPI manifest."""
+    try:
+        return await manifest_utils.build_pypi_dependency_tree_deep(client, manifest)
+    except Exception as exc:
+        logger.exception(
+            "Falling back to shallow PyPI tree due to deep resolution failure (%s)",
+            exc.__class__.__name__,
+        )
+        return manifest_utils.build_pypi_dependency_tree(manifest)
+
+
 async def _get_installation_token_for_repo(client: httpx.AsyncClient, owner: str, repo_name: str) -> str:
+    """Create a GitHub App installation token for a repository.
+
+    Args:
+        client: Shared HTTP client for GitHub requests.
+        owner: Repository owner.
+        repo_name: Repository name.
+
+    Returns:
+        str: Installation access token.
+
+    Raises:
+        HTTPException: If installation resolution or token issuance fails.
+    """
     app_jwt = get_app_jwt()
     app_headers = {
         "Accept": "application/vnd.github+json",
@@ -187,6 +283,17 @@ async def _get_installation_token_for_repo(client: httpx.AsyncClient, owner: str
 
 @router.get("/")
 async def list_repositories(current_user: User = Depends(get_current_user)) -> list[dict]:
+    """List repositories available through user installations.
+
+    Args:
+        current_user: Authenticated user with GitHub OAuth token.
+
+    Returns:
+        list[dict]: Deduplicated repository summaries.
+
+    Raises:
+        HTTPException: If GitHub APIs are unreachable or return an error.
+    """
     headers = {
         "Accept": "application/vnd.github+json",
         "Authorization": f"Bearer {current_user.access_token}",
@@ -290,6 +397,19 @@ async def get_npm_dependency_tree(
     repo_name: str,
     current_user: User = Depends(get_current_user),
 ) -> dict:
+    """Return normalized NPM dependency tree for a GitHub repository.
+
+    Args:
+        owner: Repository owner.
+        repo_name: Repository name.
+        current_user: Authenticated user with GitHub OAuth token.
+
+    Returns:
+        dict: Dependency tree rooted at project package.
+
+    Raises:
+        HTTPException: If manifests are missing, invalid, or GitHub calls fail.
+    """
     user_headers = {
         "Accept": "application/vnd.github+json",
         "Authorization": f"Bearer {current_user.access_token}",
@@ -323,14 +443,14 @@ async def get_npm_dependency_tree(
             )
 
             # Fall back to the user OAuth token if app token access is denied.
-            if installation_headers and lockfile_resp.status_code in {
+            """ if installation_headers and lockfile_resp.status_code in {
                 status.HTTP_401_UNAUTHORIZED,
                 status.HTTP_403_FORBIDDEN,
             }:
                 lockfile_resp = await client.get(
                     f"https://api.github.com/repos/{owner}/{repo_name}/contents/package-lock.json",
                     headers=user_headers,
-                )
+                ) """
 
             if lockfile_resp.status_code == status.HTTP_404_NOT_FOUND:
                 package_json_resp = await client.get(
@@ -338,14 +458,14 @@ async def get_npm_dependency_tree(
                     headers=active_headers,
                 )
 
-                if installation_headers and package_json_resp.status_code in {
+                """ if installation_headers and package_json_resp.status_code in {
                     status.HTTP_401_UNAUTHORIZED,
                     status.HTTP_403_FORBIDDEN,
                 }:
                     package_json_resp = await client.get(
                         f"https://api.github.com/repos/{owner}/{repo_name}/contents/package.json",
                         headers=user_headers,
-                    )
+                    ) """
 
                 if package_json_resp.status_code == status.HTTP_404_NOT_FOUND:
                     raise HTTPException(
@@ -392,4 +512,43 @@ async def get_npm_dependency_tree(
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="Failed to parse NPM manifest JSON content",
+        ) from exc
+
+
+@router.get("/{owner}/{repo_name}/dependencies/pypi")
+async def get_pypi_dependency_tree(
+    owner: str,
+    repo_name: str,
+    current_user: User = Depends(get_current_user),
+) -> dict:
+    """Return a normalized PyPI dependency tree for a GitHub repository.
+
+    Args:
+        owner: Repository owner.
+        repo_name: Repository name.
+        current_user: Authenticated user with GitHub OAuth token.
+
+    Returns:
+        dict: Dependency tree rooted at project package.
+
+    Raises:
+        HTTPException: If requirements are missing, invalid, or GitHub calls fail.
+    """
+    user_headers = {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {current_user.access_token}",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+    try:
+        timeout = httpx.Timeout(connect=10.0, read=20.0, write=20.0, pool=30.0)
+        limits = httpx.Limits(max_connections=20, max_keepalive_connections=10)
+        async with httpx.AsyncClient(timeout=timeout, limits=limits) as client:
+            manifest = await manifest_utils.fetch_pypi_manifest(client, owner, repo_name, user_headers)
+            return await _build_pypi_tree_from_manifest(client, manifest)
+
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Unable to reach GitHub API while fetching PyPI dependencies",
         ) from exc

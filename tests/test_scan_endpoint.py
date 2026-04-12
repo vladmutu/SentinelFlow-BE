@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -148,6 +148,8 @@ async def test_get_scan_job_returns_results(app, mock_db):
     mock_job.status = "completed"
     mock_job.total_packages = 1
     mock_job.scanned_packages = 1
+    mock_job.total_dependency_nodes = 1
+    mock_job.total_unique_packages = 1
     mock_job.error_message = None
     mock_job.started_at = now
     mock_job.completed_at = now
@@ -184,3 +186,49 @@ async def test_get_scan_job_returns_results(app, mock_db):
     assert len(body["results"]) == 1
     assert body["results"][0]["package_name"] == "lodash"
     assert body["results"][0]["malware_status"] == "clean"
+    assert body["progress_percent"] == 100.0
+    assert body["estimated_seconds_remaining"] == 0
+
+
+@pytest.mark.asyncio
+async def test_get_scan_job_running_includes_progress_metrics(app, mock_db):
+    """Running jobs should expose counters, rate and ETA fields."""
+    job_id = uuid.uuid4()
+    now = datetime.now(timezone.utc)
+
+    mock_job = MagicMock(spec=ScanJob)
+    mock_job.id = job_id
+    mock_job.owner = "owner"
+    mock_job.repo_name = "repo"
+    mock_job.ecosystem = "npm"
+    mock_job.status = "running"
+    mock_job.total_packages = 20
+    mock_job.scanned_packages = 10
+    mock_job.total_dependency_nodes = 30
+    mock_job.total_unique_packages = 20
+    mock_job.error_message = None
+    mock_job.started_at = now - timedelta(minutes=2)
+    mock_job.completed_at = None
+    mock_job.created_at = now
+    mock_job.results = []
+
+    exec_result = MagicMock()
+    exec_result.scalar_one_or_none.return_value = mock_job
+    mock_db.execute = AsyncMock(return_value=exec_result)
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        resp = await client.get(
+            f"/api/repos/owner/repo/scan/{job_id}",
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["total_dependency_nodes"] == 30
+    assert body["total_unique_packages"] == 20
+    assert body["progress_percent"] == 50.0
+    assert body["elapsed_seconds"] is not None
+    assert body["packages_per_minute"] is not None
+    assert body["estimated_seconds_remaining"] is not None

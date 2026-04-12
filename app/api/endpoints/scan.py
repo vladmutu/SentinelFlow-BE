@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import logging
 from uuid import UUID
 
@@ -35,6 +36,18 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["Scan"])
 
 
+def _to_int(value: object, default: int = 0) -> int:
+    """Convert numeric-like values to int with a safe fallback."""
+    try:
+        if value is None:
+            return default
+        if not isinstance(value, (int, float, str)):
+            return default
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 # ── Trigger ────────────────────────────────────────────────────────────
 
 @router.post(
@@ -49,7 +62,18 @@ async def trigger_scan(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> ScanTriggerResponse:
-    """Create a scan job and start it in the background."""
+    """Create a scan job and start it in the background.
+
+    Args:
+        owner: Repository owner or organization.
+        repo_name: Repository name.
+        body: Scan trigger payload containing selected ecosystem.
+        current_user: Authenticated user launching the scan.
+        db: Active asynchronous database session.
+
+    Returns:
+        ScanTriggerResponse: Identifier and initial status of the created job.
+    """
     job = ScanJob(
         owner=owner,
         repo_name=repo_name,
@@ -87,7 +111,21 @@ async def get_scan_job(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> ScanJobResponse:
-    """Return full job status including per-package results."""
+    """Return full job status including per-package results.
+
+    Args:
+        owner: Repository owner or organization.
+        repo_name: Repository name.
+        job_id: Scan job identifier.
+        current_user: Authenticated user requesting job status.
+        db: Active asynchronous database session.
+
+    Returns:
+        ScanJobResponse: Complete job model including result rows.
+
+    Raises:
+        HTTPException: If no matching scan job exists.
+    """
     stmt = (
         select(ScanJob)
         .where(ScanJob.id == job_id, ScanJob.owner == owner, ScanJob.repo_name == repo_name)
@@ -100,7 +138,54 @@ async def get_scan_job(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Scan job not found",
         )
-    return ScanJobResponse.model_validate(job)
+
+    total_packages = _to_int(job.total_packages, 0)
+    total_dependency_nodes = _to_int(job.total_dependency_nodes, 0)
+    total_unique = _to_int(job.total_unique_packages, 0) or total_packages
+    scanned_raw = _to_int(job.scanned_packages, 0)
+    scanned = min(scanned_raw, total_unique) if total_unique > 0 else scanned_raw
+
+    progress_percent = 0.0
+    if total_unique > 0:
+        progress_percent = min(100.0, max(0.0, (scanned / total_unique) * 100.0))
+
+    elapsed_seconds: int | None = None
+    packages_per_minute: float | None = None
+    estimated_seconds_remaining: int | None = None
+
+    if job.started_at is not None:
+        end_ts = job.completed_at or datetime.now(timezone.utc)
+        elapsed_seconds = max(0, int((end_ts - job.started_at).total_seconds()))
+        elapsed_minutes = elapsed_seconds / 60.0
+        if elapsed_minutes > 0 and scanned > 0:
+            packages_per_minute = round(scanned / elapsed_minutes, 2)
+
+    if job.status == "completed":
+        estimated_seconds_remaining = 0
+    elif job.status == "running" and packages_per_minute and packages_per_minute > 0 and total_unique > 0:
+        remaining = max(0, total_unique - scanned)
+        estimated_seconds_remaining = int(round((remaining / packages_per_minute) * 60.0))
+
+    return ScanJobResponse(
+        id=job.id,
+        owner=job.owner,
+        repo_name=job.repo_name,
+        ecosystem=job.ecosystem,
+        status=job.status,
+        total_packages=total_packages,
+        scanned_packages=scanned,
+        total_dependency_nodes=total_dependency_nodes,
+        total_unique_packages=total_unique,
+        progress_percent=progress_percent,
+        elapsed_seconds=elapsed_seconds,
+        packages_per_minute=packages_per_minute,
+        estimated_seconds_remaining=estimated_seconds_remaining,
+        error_message=job.error_message,
+        started_at=job.started_at,
+        completed_at=job.completed_at,
+        created_at=job.created_at,
+        results=[ScanResultResponse.model_validate(item) for item in job.results],
+    )
 
 
 # ── Graph-highlighting companion ──────────────────────────────────────
@@ -121,6 +206,15 @@ async def get_latest_scan_results(
 
     Each value contains ``malware_status``, ``malware_score``,
     ``scan_timestamp``, and ``scanner_version``.
+
+    Args:
+        owner: Repository owner or organization.
+        repo_name: Repository name.
+        current_user: Authenticated user requesting results.
+        db: Active asynchronous database session.
+
+    Returns:
+        dict[str, ScanResultMapEntry]: Mapping keyed by package identity.
     """
     # Find the latest completed job for this repo.
     job_stmt = (

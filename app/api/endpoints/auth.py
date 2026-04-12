@@ -23,6 +23,14 @@ logger = logging.getLogger(__name__)
 
 @router.get("/me")
 async def get_me(current_user: User = Depends(get_current_user)) -> dict[str, str | None]:
+    """Return profile information for the authenticated user.
+
+    Args:
+        current_user: Authenticated user loaded by dependency injection.
+
+    Returns:
+        dict[str, str | None]: Public profile fields exposed to the frontend.
+    """
     return {
         "username": current_user.username,
         "email": current_user.email,
@@ -32,6 +40,14 @@ async def get_me(current_user: User = Depends(get_current_user)) -> dict[str, st
 
 @router.get("/github/login")
 async def github_login() -> RedirectResponse:
+    """Start GitHub OAuth by redirecting to the authorization URL.
+
+    Returns:
+        RedirectResponse: Redirect to GitHub OAuth consent screen.
+
+    Raises:
+        HTTPException: If OAuth settings are missing.
+    """
     if not settings.github_client_id:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -54,6 +70,19 @@ async def github_callback(
     code: str = Query(..., min_length=1),
     db: AsyncSession = Depends(get_db),
 ) -> RedirectResponse:
+    """Handle GitHub OAuth callback and create or update the local user.
+
+    Args:
+        code: One-time OAuth authorization code from GitHub.
+        db: Active asynchronous database session.
+
+    Returns:
+        RedirectResponse: Redirect to frontend dashboard with JWT token.
+
+    Raises:
+        HTTPException: For OAuth exchange errors, GitHub API failures, or
+            database persistence failures.
+    """
     if not settings.github_client_id or not settings.github_client_secret:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -163,7 +192,17 @@ async def github_callback(
 
         jwt_token = create_access_token(subject=str(user.id))
         frontend_redirect = f"{settings.frontend_url}/dashboard?token={jwt_token}"
-        return RedirectResponse(url=frontend_redirect, status_code=status.HTTP_307_TEMPORARY_REDIRECT)
+        response = RedirectResponse(url=frontend_redirect, status_code=status.HTTP_307_TEMPORARY_REDIRECT)
+        response.set_cookie(
+            key="access_token",
+            value=jwt_token,
+            httponly=True,
+            secure=not settings.app_debug,
+            samesite="lax",
+            max_age=settings.jwt_expire_minutes * 60,
+            path="/",
+        )
+        return response
 
     except httpx.HTTPStatusError as exc:
         raise HTTPException(

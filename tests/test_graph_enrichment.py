@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -154,3 +155,146 @@ async def test_result_map_keys_match_tree_node_identities(app, mock_db):
 
     body = resp.json()
     assert "@babel/core@7.22.0" in body
+
+
+@pytest.mark.asyncio
+async def test_pypi_dependency_tree_returns_graph_shape(app):
+    """The PyPI dependency endpoint should return nested graph data for frontend rendering."""
+    manifest = {
+        "name": "sentinel-project",
+        "version": "1.2.3",
+        "dependencies": {
+            "requests": "2.31.0",
+            "flask": "3.0.2",
+        },
+    }
+    deep_tree = {
+        "name": "sentinel-project",
+        "version": "1.2.3",
+        "children": [
+            {
+                "name": "requests",
+                "version": "2.31.0",
+                "children": [
+                    {"name": "urllib3", "version": "2.2.2", "children": []},
+                ],
+            },
+            {
+                "name": "flask",
+                "version": "3.0.2",
+                "children": [
+                    {"name": "werkzeug", "version": "3.0.1", "children": []},
+                ],
+            },
+        ],
+    }
+
+    with patch(
+        "app.api.endpoints.repos.manifest_utils.fetch_pypi_manifest",
+        AsyncMock(return_value=manifest),
+    ), patch(
+        "app.api.endpoints.repos.manifest_utils.build_pypi_dependency_tree_deep",
+        AsyncMock(return_value=deep_tree),
+    ):
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            resp = await client.get("/api/repos/owner/repo/dependencies/pypi")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["name"] == "sentinel-project"
+    assert body["version"] == "1.2.3"
+    assert {child["name"] for child in body["children"]} == {"requests", "flask"}
+    requests_node = next(child for child in body["children"] if child["name"] == "requests")
+    assert requests_node["children"][0]["name"] == "urllib3"
+
+
+@pytest.mark.asyncio
+async def test_pypi_dependency_tree_falls_back_to_shallow_when_deep_fails(app):
+    """If deep PyPI resolution fails, endpoint should still return a usable graph."""
+    manifest = {
+        "name": "sentinel-project",
+        "version": "1.2.3",
+        "dependencies": {
+            "requests": "2.31.0",
+            "flask": "3.0.2",
+        },
+    }
+
+    with patch(
+        "app.api.endpoints.repos.manifest_utils.fetch_pypi_manifest",
+        AsyncMock(return_value=manifest),
+    ), patch(
+        "app.api.endpoints.repos.manifest_utils.build_pypi_dependency_tree_deep",
+        AsyncMock(side_effect=RuntimeError("pypi unavailable")),
+    ):
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            resp = await client.get("/api/repos/owner/repo/dependencies/pypi")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["name"] == "sentinel-project"
+    assert body["version"] == "1.2.3"
+    assert {child["name"] for child in body["children"]} == {"requests", "flask"}
+
+
+@pytest.mark.asyncio
+async def test_pypi_dependency_tree_limits_metadata_concurrency():
+    """Large PyPI dependency sets should not exceed the configured fetch concurrency."""
+
+    class DummyResponse:
+        def __init__(self, package_name: str):
+            self.status_code = 200
+            self.is_error = False
+            self._package_name = package_name
+
+        def json(self):
+            return {
+                "info": {
+                    "name": self._package_name,
+                    "version": "1.0.0",
+                    "requires_dist": [],
+                }
+            }
+
+    active_requests = 0
+    peak_requests = 0
+
+    async def fake_get(url: str):
+        nonlocal active_requests, peak_requests
+        active_requests += 1
+        peak_requests = max(peak_requests, active_requests)
+        try:
+            await asyncio.sleep(0.02)
+            package_name = url.split("/pypi/", 1)[1].split("/", 1)[0]
+            return DummyResponse(package_name)
+        finally:
+            active_requests -= 1
+
+    manifest = {
+        "name": "sentinel-project",
+        "version": "1.2.3",
+        "dependencies": {f"pkg-{index}": "1.0.0" for index in range(20)},
+    }
+
+    mock_client = AsyncMock()
+    mock_client.get = fake_get
+
+    from app.services.manifest_utils import build_pypi_dependency_tree_deep
+
+    tree = await build_pypi_dependency_tree_deep(
+        mock_client,
+        manifest,
+        max_depth=2,
+        max_children=5,
+        max_concurrency=3,
+    )
+
+    assert tree["name"] == "sentinel-project"
+    assert len(tree["children"]) == 20
+    assert peak_requests <= 3

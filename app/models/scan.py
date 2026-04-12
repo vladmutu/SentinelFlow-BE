@@ -24,6 +24,8 @@ class ScanJob(Base):
     )  # pending → running → completed | failed
     total_packages: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     scanned_packages: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    total_dependency_nodes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    total_unique_packages: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

@@ -16,5 +16,10 @@ AsyncSessionLocal = async_sessionmaker(
 
 
 async def get_db() -> AsyncSession:
+    """Yield a transactional async database session for request handlers.
+
+    Yields:
+        AsyncSession: Open SQLAlchemy async session.
+    """
     async with AsyncSessionLocal() as session:
         yield session

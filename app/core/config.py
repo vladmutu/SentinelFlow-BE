@@ -46,6 +46,11 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
+    """Return cached application settings loaded from environment variables.
+
+    Returns:
+        Settings: Singleton configuration object.
+    """
     return Settings()
 
 

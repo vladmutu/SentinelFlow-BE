@@ -74,7 +74,11 @@ async def test_packages_scanned_in_parallel():
         mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
 
         mock_manifest.fetch_npm_manifest = AsyncMock(return_value={"lockfileVersion": 2})
-        mock_manifest.flatten_dependencies = MagicMock(return_value=packages)
+        mock_workload = MagicMock()
+        mock_workload.refs = packages
+        mock_workload.total_dependency_nodes = len(packages)
+        mock_workload.unique_packages = len(packages)
+        mock_manifest.build_npm_scan_workload = MagicMock(return_value=mock_workload)
         mock_fetcher.fetch_npm_package = fake_fetch_npm
         mock_scanner.classify = MagicMock(return_value=verdict)
         mock_scanner.SCANNER_VERSION = "1.0.0"
@@ -158,7 +162,11 @@ async def test_single_package_failure_does_not_abort_job():
         mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
 
         mock_manifest.fetch_npm_manifest = AsyncMock(return_value={"lockfileVersion": 2})
-        mock_manifest.flatten_dependencies = MagicMock(return_value=packages)
+        mock_workload = MagicMock()
+        mock_workload.refs = packages
+        mock_workload.total_dependency_nodes = len(packages)
+        mock_workload.unique_packages = len(packages)
+        mock_manifest.build_npm_scan_workload = MagicMock(return_value=mock_workload)
         mock_fetcher.fetch_npm_package = fail_first_fetch
         mock_scanner.classify = MagicMock(return_value=verdict)
         mock_scanner.SCANNER_VERSION = "1.0.0"

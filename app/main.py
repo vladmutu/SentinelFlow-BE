@@ -12,6 +12,11 @@ from app.db.session import get_db
 
 
 def create_app() -> FastAPI:
+    """Create and configure the FastAPI application instance.
+
+    Returns:
+        FastAPI: Configured application with routers and middleware.
+    """
     app = FastAPI(
         title=settings.app_name,
         debug=settings.app_debug,
@@ -32,6 +37,17 @@ def create_app() -> FastAPI:
 
     @app.get(f"{settings.api_v1_prefix}/health", tags=["Health"])
     async def health_check(db: AsyncSession = Depends(get_db)) -> dict[str, str]:
+        """Validate service and database availability.
+
+        Args:
+            db: Active asynchronous database session.
+
+        Returns:
+            dict[str, str]: Health status payload.
+
+        Raises:
+            HTTPException: If the database connectivity check fails.
+        """
         try:
             await db.execute(text("SELECT 1"))
             return {"status": "ok", "database": "reachable"}

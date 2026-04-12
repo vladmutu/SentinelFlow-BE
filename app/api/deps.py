@@ -1,7 +1,7 @@
 from uuid import UUID
 
 import httpx
-from fastapi import Depends, HTTPException, status
+from fastapi import Cookie, Depends, Header, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
@@ -11,19 +11,45 @@ from app.core.security import decode_access_token
 from app.db.session import get_db
 from app.models.user import User
 
-bearer_scheme = HTTPBearer(auto_error=True)
+bearer_scheme = HTTPBearer(auto_error=False)
 
 
 async def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+    authorization: str | None = Header(default=None),
+    access_token_cookie: str | None = Cookie(default=None, alias="access_token"),
     db: AsyncSession = Depends(get_db),
 ) -> User:
+    """Resolve and validate the authenticated user from bearer credentials.
+
+    Args:
+        credentials: Parsed HTTP bearer authorization credentials.
+        db: Active asynchronous database session.
+
+    Returns:
+        User: Authenticated and GitHub-token-validated user.
+
+    Raises:
+        HTTPException: For invalid tokens, missing users, GitHub token failures,
+            upstream GitHub errors, or database failures.
+    """
     unauthorized = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",
     )
 
-    token = credentials.credentials
+    token = None
+    if credentials is not None:
+        token = credentials.credentials
+    elif authorization and authorization.lower().startswith("bearer "):
+        token = authorization.split(" ", 1)[1].strip()
+    elif access_token_cookie:
+        token = access_token_cookie.strip()
+
+    if not token:
+        raise unauthorized
+
     try:
         payload = decode_access_token(token)
         subject = payload.get("sub")

@@ -39,6 +39,11 @@ class JobRunner:
     # ── internal ───────────────────────────────────────────────────────
     @staticmethod
     def _on_done(task: asyncio.Task) -> None:
+        """Log terminal state for a completed background task.
+
+        Args:
+            task: Completed task returned by ``asyncio.create_task``.
+        """
         if task.cancelled():
             logger.warning("Background job was cancelled")
             return

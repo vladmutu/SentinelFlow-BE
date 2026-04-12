@@ -41,6 +41,12 @@ class ScanJobResponse(BaseModel):
     status: str
     total_packages: int
     scanned_packages: int
+    total_dependency_nodes: int = 0
+    total_unique_packages: int = 0
+    progress_percent: float = 0.0
+    elapsed_seconds: int | None = None
+    packages_per_minute: float | None = None
+    estimated_seconds_remaining: int | None = None
     error_message: str | None = None
     started_at: datetime | None = None
     completed_at: datetime | None = None
