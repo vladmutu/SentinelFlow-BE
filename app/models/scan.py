@@ -1,4 +1,4 @@
-"""ORM models for malware-scan jobs and per-package scan results."""
+"""ORM models for malware-scan jobs, per-package tasks, and scan results."""
 
 from datetime import datetime, timezone
 from uuid import UUID, uuid4
@@ -23,6 +23,7 @@ class ScanJob(Base):
         String(50), nullable=False, default="pending",
     )  # pending → running → completed | failed
     total_packages: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    processed_packages: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     scanned_packages: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     total_dependency_nodes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     total_unique_packages: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
@@ -33,6 +34,10 @@ class ScanJob(Base):
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),
         nullable=False,
+    )
+
+    tasks: Mapped[list["ScanTask"]] = relationship(
+        "ScanTask", back_populates="job", cascade="all, delete-orphan", lazy="selectin",
     )
 
     results: Mapped[list["ScanResult"]] = relationship(
@@ -75,4 +80,47 @@ class ScanResult(Base):
     __table_args__ = (
         Index("ix_scan_results_job_id", "job_id"),
         Index("ix_scan_results_package", "package_name", "package_version", "ecosystem"),
+    )
+
+
+class ScanTask(Base):
+    """Tracks the lifecycle and verdict for one package scan task."""
+
+    __tablename__ = "scan_tasks"
+
+    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
+    job_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("scan_jobs.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    package_name: Mapped[str] = mapped_column(String(512), nullable=False)
+    package_version: Mapped[str] = mapped_column(String(255), nullable=False)
+    ecosystem: Mapped[str] = mapped_column(String(50), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(50), nullable=False, default="pending",
+    )  # pending → downloading → analyzing → classifying → done | failed
+    malware_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    malware_status: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    job: Mapped["ScanJob"] = relationship("ScanJob", back_populates="tasks")
+
+    __table_args__ = (
+        Index("ix_scan_tasks_job_id", "job_id"),
+        Index("ix_scan_tasks_status", "status"),
+        Index("ix_scan_tasks_package", "package_name", "package_version", "ecosystem"),
     )

@@ -208,6 +208,47 @@ def _extract_archive(archive_path: Path, dest_dir: Path) -> Path:
     return dest_dir
 
 
+def extract_features(artifact_path: Path) -> pd.DataFrame:
+    """Extract model features for a package artifact.
+
+    This is a blocking function and should be called via ``asyncio.to_thread``
+    from async code.
+    """
+    _ensure_model_loaded()
+
+    if artifact_path.is_file():
+        tmp_extract = Path(tempfile.mkdtemp(prefix="sentinel_extract_"))
+        try:
+            package_dir = _extract_archive(artifact_path, tmp_extract)
+            return _extract_features_from_directory(package_dir)
+        finally:
+            import shutil
+
+            shutil.rmtree(tmp_extract, ignore_errors=True)
+
+    if artifact_path.is_dir():
+        return _extract_features_from_directory(artifact_path)
+
+    raise FileNotFoundError(f"Artifact not found: {artifact_path}")
+
+
+def classify_features(features: pd.DataFrame) -> ScanVerdict:
+    """Run classifier inference on an already extracted feature frame."""
+    try:
+        _ensure_model_loaded()
+        probabilities = _classifier.predict_proba(features)[0]
+        malware_prob = float(probabilities[1]) if len(probabilities) > 1 else float(probabilities[0])
+        status = "malicious" if malware_prob >= _threshold else "clean"
+        return ScanVerdict(malware_status=status, malware_score=round(malware_prob, 6))
+    except Exception as exc:
+        logger.exception("Classifier inference error")
+        return ScanVerdict(
+            malware_status="error",
+            malware_score=None,
+            error_message=str(exc),
+        )
+
+
 def classify(artifact_path: Path) -> ScanVerdict:
     """Run the ML classifier on a package artifact (archive or directory).
 
@@ -215,42 +256,8 @@ def classify(artifact_path: Path) -> ScanVerdict:
     async code so the event loop isn't stalled.
     """
     try:
-        _ensure_model_loaded()
-    except FileNotFoundError as exc:
-        return ScanVerdict(
-            malware_status="error",
-            malware_score=None,
-            error_message=str(exc),
-        )
-
-    try:
-        # If the artifact is an archive, extract it first.
-        if artifact_path.is_file():
-            tmp_extract = Path(tempfile.mkdtemp(prefix="sentinel_extract_"))
-            try:
-                package_dir = _extract_archive(artifact_path, tmp_extract)
-                features = _extract_features_from_directory(package_dir)
-            finally:
-                import shutil
-                shutil.rmtree(tmp_extract, ignore_errors=True)
-        elif artifact_path.is_dir():
-            features = _extract_features_from_directory(artifact_path)
-        else:
-            return ScanVerdict(
-                malware_status="error",
-                malware_score=None,
-                error_message=f"Artifact not found: {artifact_path}",
-            )
-
-        probabilities = _classifier.predict_proba(features)[0]
-        malware_prob = float(probabilities[1]) if len(probabilities) > 1 else float(probabilities[0])
-
-        status = "malicious" if malware_prob >= _threshold else "clean"
-
-        return ScanVerdict(
-            malware_status=status,
-            malware_score=round(malware_prob, 6),
-        )
+        features = extract_features(artifact_path)
+        return classify_features(features)
 
     except Exception as exc:
         logger.exception("Classifier error for %s", artifact_path)

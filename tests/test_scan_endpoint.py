@@ -68,7 +68,11 @@ async def test_trigger_scan_returns_202(app, mock_db):
     mock_db.refresh = AsyncMock(side_effect=_fake_refresh)
 
     with patch("app.api.endpoints.scan.job_runner") as mock_runner:
-        mock_runner.submit = MagicMock()
+        def _submit_and_close(coro):
+            coro.close()
+            return MagicMock()
+
+        mock_runner.submit = MagicMock(side_effect=_submit_and_close)
 
         async with AsyncClient(
             transport=ASGITransport(app=app),
@@ -84,6 +88,47 @@ async def test_trigger_scan_returns_202(app, mock_db):
     assert "job_id" in body
     assert body["status"] == "pending"
     mock_runner.submit.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_trigger_scan_accepts_selected_packages(app, mock_db):
+    """Selected package identifiers should be passed to orchestration."""
+
+    async def _fake_refresh(obj):
+        if not hasattr(obj, "id") or obj.id is None:
+            obj.id = uuid.uuid4()
+        if not hasattr(obj, "status") or obj.status is None:
+            obj.status = "pending"
+
+    mock_db.refresh = AsyncMock(side_effect=_fake_refresh)
+
+    with patch("app.api.endpoints.scan.job_runner") as mock_runner:
+        captured = {"kwargs": None}
+
+        def _submit_and_close(coro):
+            frame = getattr(coro, "cr_frame", None)
+            if frame is not None:
+                captured["kwargs"] = dict(frame.f_locals)
+            coro.close()
+            return MagicMock()
+
+        mock_runner.submit = MagicMock(side_effect=_submit_and_close)
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            resp = await client.post(
+                "/api/repos/owner/repo/scan",
+                json={
+                    "ecosystem": "npm",
+                    "selected_packages": ["lodash", "@types/node@22.0.0"],
+                },
+            )
+
+    assert resp.status_code == 202
+    assert captured["kwargs"] is not None
+    assert captured["kwargs"]["selected_packages"] == ["lodash", "@types/node@22.0.0"]
 
 
 @pytest.mark.asyncio

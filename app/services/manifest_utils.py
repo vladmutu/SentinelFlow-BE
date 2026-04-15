@@ -213,46 +213,9 @@ def flatten_pypi_manifest(manifest: dict) -> list[PackageRef]:
 def build_npm_scan_workload(manifest: dict, tree: dict) -> NpmScanWorkload:
     """Build npm scan workload metrics from lockfile-first data.
 
-    If a v2+ lockfile ``packages`` map is present, metrics and scan refs are
-    computed directly from that map because it is the most complete dependency
-    source for scanning. Otherwise it falls back to the normalized tree.
+    Scan workload is derived from the normalized dependency tree so scan counts
+    match what the dependency graph endpoint exposes to clients.
     """
-    packages = manifest.get("packages")
-    if isinstance(packages, dict) and packages:
-        total_dependency_nodes = 0
-        refs: list[PackageRef] = []
-        seen: set[str] = set()
-
-        for pkg_path, entry in packages.items():
-            if pkg_path == "":
-                continue
-            if not isinstance(entry, dict):
-                continue
-            total_dependency_nodes += 1
-
-            name = entry.get("name")
-            version = entry.get("version")
-
-            if not isinstance(name, str) or not name:
-                tail = pkg_path.rsplit("/node_modules/", 1)[-1]
-                name = tail or None
-            if not isinstance(version, str) or not version:
-                continue
-            if not isinstance(name, str) or not name:
-                continue
-
-            key = f"{name}@{version}"
-            if key in seen:
-                continue
-            seen.add(key)
-            refs.append(PackageRef(name=name, version=version))
-
-        return NpmScanWorkload(
-            total_dependency_nodes=total_dependency_nodes,
-            unique_packages=len(refs),
-            refs=refs,
-        )
-
     refs = flatten_dependencies(tree)
     return NpmScanWorkload(
         total_dependency_nodes=count_dependency_nodes(tree),

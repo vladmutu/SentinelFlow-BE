@@ -14,6 +14,14 @@ class ScanTriggerRequest(BaseModel):
         pattern=r"^(npm|pypi)$",
         description="Package ecosystem to scan: 'npm' or 'pypi'",
     )
+    selected_packages: list[str] | None = Field(
+        default=None,
+        description=(
+            "Optional package identifiers to scan. Supports package name "
+            "(e.g. 'lodash') or exact name@version "
+            "(e.g. 'lodash@4.17.21', '@types/node@22.0.0')."
+        ),
+    )
 
 
 # ── Responses ──────────────────────────────────────────────────────────
