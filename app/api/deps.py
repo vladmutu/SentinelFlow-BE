@@ -108,3 +108,36 @@ async def get_current_user(
         ) from exc
 
     return user
+
+
+async def require_authenticated_token(
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+    authorization: str | None = Header(default=None),
+    access_token_cookie: str | None = Cookie(default=None, alias="access_token"),
+) -> UUID:
+    """Validate request authentication token without loading user from DB.
+
+    Useful for high-frequency endpoints where only authentication presence is required.
+    """
+    unauthorized = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+    )
+
+    token = None
+    if credentials is not None:
+        token = credentials.credentials
+    elif authorization and authorization.lower().startswith("bearer "):
+        token = authorization.split(" ", 1)[1].strip()
+    elif access_token_cookie:
+        token = access_token_cookie.strip()
+
+    if not token:
+        raise unauthorized
+
+    try:
+        payload = decode_access_token(token)
+        subject = payload.get("sub")
+        return UUID(subject)
+    except (ValueError, TypeError):
+        raise unauthorized

@@ -3,13 +3,19 @@ import json
 import logging
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 
-from app.api.deps import get_current_user
+from app.api.deps import get_current_user, require_authenticated_token
+from app.api.schemas.dependency import (
+    AddDependencyRequest,
+    AddDependencyResponse,
+    PackageSearchResponse,
+    PackageVersionsResponse,
+)
 from app.core.config import settings
 from app.core.github_app import get_app_jwt
 from app.models.user import User
-from app.services import manifest_utils
+from app.services import manifest_utils, package_fetcher, pr_creator
 
 router = APIRouter(tags=["Repositories"])
 logger = logging.getLogger(__name__)
@@ -551,4 +557,193 @@ async def get_pypi_dependency_tree(
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="Unable to reach GitHub API while fetching PyPI dependencies",
+        ) from exc
+
+
+@router.post(
+    "/{owner}/{repo_name}/dependencies/add",
+    status_code=status.HTTP_202_ACCEPTED,
+    response_model=AddDependencyResponse,
+)
+async def add_dependencies_via_pr(
+    owner: str,
+    repo_name: str,
+    payload: AddDependencyRequest,
+    current_user: User = Depends(get_current_user),
+) -> AddDependencyResponse:
+    """Create a pull request that adds or updates dependencies.
+
+    For npm, updates both ``package.json`` and ``package-lock.json``.
+    For pypi, updates ``requirements.txt``.
+    """
+    user_headers = {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {current_user.access_token}",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            active_headers = user_headers
+            try:
+                installation_token = await _get_installation_token_for_repo(client, owner, repo_name)
+                active_headers = {
+                    "Accept": "application/vnd.github+json",
+                    "Authorization": f"Bearer {installation_token}",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                }
+            except HTTPException as exc:
+                if exc.status_code not in {
+                    status.HTTP_401_UNAUTHORIZED,
+                    status.HTTP_403_FORBIDDEN,
+                    status.HTTP_404_NOT_FOUND,
+                    status.HTTP_502_BAD_GATEWAY,
+                }:
+                    raise
+
+            if payload.ecosystem == "npm":
+                pr_result = await pr_creator.create_npm_dependency_pr(
+                    client=client,
+                    owner=owner,
+                    repo_name=repo_name,
+                    headers=active_headers,
+                    dependencies=payload.dependencies,
+                    updated_package_lock_json=payload.updated_package_lock_json,
+                    preferred_branch_name=payload.branch_name,
+                    pr_title=payload.pr_title,
+                    pr_body=payload.pr_body,
+                    idempotency_key=payload.idempotency_key,
+                    generate_lockfile_server_side=payload.generate_lockfile_server_side,
+                )
+            else:
+                pr_result = await pr_creator.create_pypi_dependency_pr(
+                    client=client,
+                    owner=owner,
+                    repo_name=repo_name,
+                    headers=active_headers,
+                    dependencies=payload.dependencies,
+                    preferred_branch_name=payload.branch_name,
+                    pr_title=payload.pr_title,
+                    pr_body=payload.pr_body,
+                    idempotency_key=payload.idempotency_key,
+                )
+
+            return AddDependencyResponse(
+                pr_url=pr_result.pr_url,
+                pr_number=pr_result.pr_number,
+                branch_name=pr_result.branch_name,
+            )
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Unable to reach GitHub API while creating dependency pull request",
+        ) from exc
+
+
+@router.get(
+    "/packages/search",
+    response_model=PackageSearchResponse,
+)
+async def search_packages_proxy(
+    ecosystem: str = Query(..., pattern=r"^(npm|pypi)$"),
+    q: str = Query(..., min_length=1, max_length=128),
+    authenticated_user_id: object = Depends(require_authenticated_token),
+) -> PackageSearchResponse:
+    """Proxy package search to npm/PyPI and add typosquatting hints.
+
+    Frontend should call this endpoint instead of talking to public registries directly.
+    """
+    del authenticated_user_id
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            cleaned_query = q.strip()
+            if not cleaned_query:
+                return PackageSearchResponse(
+                    ecosystem=ecosystem,
+                    query="",
+                    total=0,
+                    results=[],
+                    did_you_mean=None,
+                )
+            if ecosystem == "npm":
+                results = await package_fetcher.search_npm_packages(
+                    cleaned_query,
+                    client=client,
+                )
+            else:
+                results = await package_fetcher.search_pypi_packages(
+                    cleaned_query,
+                    client=client,
+                )
+
+        suggestion = package_fetcher.suggest_package_name(
+            ecosystem,
+            cleaned_query,
+            results,
+        )
+
+        return PackageSearchResponse(
+            ecosystem=ecosystem,
+            query=cleaned_query,
+            total=len(results),
+            results=results,
+            did_you_mean=suggestion,
+        )
+    except httpx.HTTPStatusError as exc:
+        upstream_status = exc.response.status_code
+        if upstream_status == status.HTTP_404_NOT_FOUND:
+            return PackageSearchResponse(
+                ecosystem=ecosystem,
+                query=q.strip(),
+                total=0,
+                results=[],
+                did_you_mean=None,
+            )
+
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Registry API error while searching packages: {upstream_status}",
+        ) from exc
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Unable to reach registry API while searching packages",
+        ) from exc
+
+
+@router.get(
+    "/packages/versions",
+    response_model=PackageVersionsResponse,
+)
+async def get_package_versions_proxy(
+    ecosystem: str = Query(..., pattern=r"^(npm|pypi)$"),
+    name: str = Query(..., min_length=1, max_length=214),
+    authenticated_user_id: object = Depends(require_authenticated_token),
+) -> PackageVersionsResponse:
+    """Proxy package version lookup to npm/PyPI for frontend version selection."""
+    del authenticated_user_id
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            if ecosystem == "npm":
+                payload = await package_fetcher.list_npm_package_versions(name, client=client)
+            else:
+                payload = await package_fetcher.list_pypi_package_versions(name, client=client)
+
+        return PackageVersionsResponse.model_validate(payload)
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Package not found: {name}",
+        )
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Registry API error while loading package versions: {exc.response.status_code}",
+        ) from exc
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Unable to reach registry API while loading package versions",
         ) from exc

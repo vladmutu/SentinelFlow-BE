@@ -43,6 +43,21 @@ class Settings(BaseSettings):
     scanner_model_path: str = Field(default="malware_classifier.pkl", alias="SCANNER_MODEL_PATH")
     scanner_threshold_path: str = Field(default="malware_threshold.pkl", alias="SCANNER_THRESHOLD_PATH")
 
+    # Dependency PR workflow settings
+    npm_lockfile_generation_enabled: bool = Field(
+        default=True,
+        alias="NPM_LOCKFILE_GENERATION_ENABLED",
+    )
+    npm_lockfile_generation_timeout_seconds: int = Field(
+        default=120,
+        alias="NPM_LOCKFILE_GENERATION_TIMEOUT_SECONDS",
+    )
+
+    librariesio_api_key: str = Field(
+        default="",
+        alias="LIBRARIESIO_API_KEY",
+    )
+
 
 @lru_cache
 def get_settings() -> Settings:
