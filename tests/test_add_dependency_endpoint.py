@@ -266,6 +266,8 @@ async def test_search_packages_proxy_npm_returns_results(app):
     body = resp.json()
     assert body["ecosystem"] == "npm"
     assert body["query"] == "lodash"
+    assert body["page"] == 1
+    assert body["limit"] == 5
     assert body["total"] == 1
     assert body["results"][0]["name"] == "lodasb"
     assert body["results"][0]["monthly_downloads"] == 4
@@ -313,6 +315,8 @@ async def test_search_packages_proxy_pypi_routes_to_pypi_search(app):
     assert resp.status_code == 200
     body = resp.json()
     assert body["ecosystem"] == "pypi"
+    assert body["page"] == 1
+    assert body["limit"] == 8
     assert body["total"] == 1
     assert body["results"][0]["monthly_downloads"] == 1385411770
     assert body["did_you_mean"] is None

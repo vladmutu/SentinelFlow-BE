@@ -500,11 +500,15 @@ async def _load_librariesio_pypi_package(
 async def _search_librariesio_pypi_packages(
     query: str,
     *,
+    page: int,
+    limit: int,
     client: httpx.AsyncClient,
 ) -> list[dict]:
     params: dict[str, str | int] = {
         "q": query,
         "platforms": "PyPI",
+        "page": page,
+        "per_page": limit,
     }
     if settings.librariesio_api_key:
         params["api_key"] = settings.librariesio_api_key
@@ -586,6 +590,8 @@ async def _enrich_pypi_results_with_librariesio(
 async def search_npm_packages(
     query: str,
     *,
+    page: int = 1,
+    limit: int = 8,
     client: httpx.AsyncClient | None = None,
 ) -> list[dict]:
     """Search npm packages and return normalized candidates with typo signals."""
@@ -594,10 +600,13 @@ async def search_npm_packages(
         client = httpx.AsyncClient(timeout=_TIMEOUT)
 
     try:
+        page = max(page, 1)
+        limit = max(limit, 1)
+        from_index = (page - 1) * limit
         resp = await _get_with_retry(
             client,
             f"{_NPM_REGISTRY}/-/v1/search",
-            params={"text": query},
+            params={"text": query, "size": min(limit, 250), "from": from_index},
         )
         resp.raise_for_status()
         payload = resp.json()
@@ -642,6 +651,8 @@ async def search_npm_packages(
 async def search_pypi_packages(
     query: str,
     *,
+    page: int = 1,
+    limit: int = 8,
     client: httpx.AsyncClient | None = None,
 ) -> list[dict]:
     """Search PyPI packages via the public search endpoint and parse top hits."""
@@ -650,7 +661,11 @@ async def search_pypi_packages(
         client = httpx.AsyncClient(timeout=_TIMEOUT)
 
     try:
-        results = await _search_librariesio_pypi_packages(query, client=client)
+        page = max(page, 1)
+        limit = max(limit, 1)
+
+        results = await _search_librariesio_pypi_packages(query, page=page, limit=limit, client=client)
+        used_librariesio_search = bool(results)
 
         if not results:
             resp = await _get_with_retry(
@@ -729,6 +744,13 @@ async def search_pypi_packages(
 
             if results:
                 await _enrich_pypi_results_with_librariesio(results, client=client)
+
+            start_index = (page - 1) * limit
+            results = results[start_index : start_index + limit]
+
+        elif used_librariesio_search:
+            # Libraries.io search already paginates server-side.
+            pass
 
         await _enrich_monthly_downloads(results, ecosystem="pypi", client=client)
 

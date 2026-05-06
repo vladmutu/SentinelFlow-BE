@@ -49,6 +49,80 @@ def _to_int(value: object, default: int = 0) -> int:
         return default
 
 
+def _to_bool(value: object, default: bool = False) -> bool:
+    return value if isinstance(value, bool) else default
+
+
+def _to_string_list(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value if isinstance(item, str)]
+
+
+def _extract_risk_breakdown(risk_assessment: dict[str, object] | None) -> dict[str, object] | None:
+    if not isinstance(risk_assessment, dict):
+        return None
+    metadata = risk_assessment.get("metadata")
+    if not isinstance(metadata, dict):
+        return None
+    scoring = metadata.get("scoring")
+    if not isinstance(scoring, dict):
+        return None
+    breakdown = scoring.get("breakdown")
+    return breakdown if isinstance(breakdown, dict) else None
+
+
+def _extract_risk_visibility_fields(item: ScanResult) -> dict[str, object]:
+    risk_assessment = item.risk_assessment if isinstance(item.risk_assessment, dict) else None
+    metadata = risk_assessment.get("metadata") if isinstance(risk_assessment, dict) else None
+    dynamic_meta = metadata.get("dynamic") if isinstance(metadata, dict) else None
+
+    risk_breakdown = item.risk_breakdown
+    if not isinstance(risk_breakdown, dict):
+        risk_breakdown = _extract_risk_breakdown(risk_assessment)
+
+    return {
+        "risk_breakdown": risk_breakdown,
+        "risk_overall_status": risk_assessment.get("overall_status") if isinstance(risk_assessment, dict) else None,
+        "risk_overall_score": risk_assessment.get("overall_score") if isinstance(risk_assessment, dict) else None,
+        "risk_allowlisted": _to_bool(item.risk_allowlisted, bool(risk_assessment.get("allowlisted", False)) if isinstance(risk_assessment, dict) else False),
+        "risk_suppressed": _to_bool(item.risk_suppressed, bool(risk_assessment.get("suppressed", False)) if isinstance(risk_assessment, dict) else False),
+        "risk_suppression_reason": item.risk_suppression_reason or (risk_assessment.get("suppression_reason") if isinstance(risk_assessment, dict) else None),
+        "analysis_status": item.analysis_status or (dynamic_meta.get("status") if isinstance(dynamic_meta, dict) else None),
+        "analysis_coverage": item.analysis_coverage or (dynamic_meta.get("coverage") if isinstance(dynamic_meta, dict) else None),
+        "advisory_references": item.advisory_references if isinstance(item.advisory_references, list) else _to_string_list(risk_assessment.get("advisory_references") if isinstance(risk_assessment, dict) else None),
+    }
+
+
+def _to_scan_result_response(item: ScanResult) -> ScanResultResponse:
+    payload = {
+        "id": item.id,
+        "package_name": item.package_name,
+        "package_version": item.package_version,
+        "ecosystem": item.ecosystem,
+        "malware_status": item.malware_status,
+        "malware_score": item.malware_score,
+        "scanner_version": item.scanner_version,
+        "error_message": item.error_message,
+        "scan_timestamp": item.scan_timestamp,
+        "risk_assessment": item.risk_assessment,
+    }
+    payload.update(_extract_risk_visibility_fields(item))
+    return ScanResultResponse.model_validate(payload)
+
+
+def _to_scan_result_map_entry(item: ScanResult) -> ScanResultMapEntry:
+    payload = {
+        "malware_status": item.malware_status,
+        "malware_score": item.malware_score,
+        "scan_timestamp": item.scan_timestamp,
+        "scanner_version": item.scanner_version,
+        "risk_assessment": item.risk_assessment,
+    }
+    payload.update(_extract_risk_visibility_fields(item))
+    return ScanResultMapEntry.model_validate(payload)
+
+
 # ── Trigger ────────────────────────────────────────────────────────────
 
 @router.post(
@@ -249,7 +323,7 @@ async def get_latest_scan_job(
             started_at=job.started_at,
             completed_at=job.completed_at,
             created_at=job.created_at,
-            results=[ScanResultResponse.model_validate(item) for item in job.results],
+            results=[_to_scan_result_response(item) for item in job.results],
         )
     except Exception as e:
         logger.error(
@@ -310,7 +384,7 @@ async def get_latest_scan_results(
     rows = (await db.execute(results_stmt)).scalars().all()
 
     return {
-        f"{r.package_name}@{r.package_version}": ScanResultMapEntry.model_validate(r)
+        f"{r.package_name}@{r.package_version}": _to_scan_result_map_entry(r)
         for r in rows
     }
 
@@ -402,5 +476,5 @@ async def get_scan_job(
         started_at=job.started_at,
         completed_at=job.completed_at,
         created_at=job.created_at,
-        results=[ScanResultResponse.model_validate(item) for item in job.results],
+        results=[_to_scan_result_response(item) for item in job.results],
     )

@@ -294,7 +294,10 @@ def _build_updated_package_json(
         )
 
     for dep in dependencies:
-        deps[dep.name] = dep.version
+        existing_spec = deps.get(dep.name)
+        existing_str = existing_spec if isinstance(existing_spec, str) else None
+        _ensure_npm_update_is_compatible(dep.name, existing_str, dep.version)
+        deps[dep.name] = _normalize_npm_update_spec(existing_str, dep.version)
 
     parsed["dependencies"] = deps
     return json.dumps(parsed, indent=2, ensure_ascii=False) + "\n"
@@ -320,6 +323,265 @@ def _validate_updated_lockfile(content: str) -> str:
 
 _EXACT_SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$")
 _REQ_NAME_RE = re.compile(r"^\s*([A-Za-z0-9_.-]+)")
+_REQ_SPEC_RE = re.compile(r"^\s*[A-Za-z0-9_.-]+\s*([^;#]+)?")
+_COMPARATOR_TOKEN_RE = re.compile(r"(==|!=|~=|>=|<=|>|<)\s*([^,\s]+)")
+
+
+def _parse_semver_tuple(value: str) -> tuple[int, int, int] | None:
+    match = re.match(r"^(\d+)\.(\d+)\.(\d+)", value.strip().lstrip("v"))
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2)), int(match.group(3))
+
+
+def _compare_semver(left: str, right: str) -> int | None:
+    left_tuple = _parse_semver_tuple(left)
+    right_tuple = _parse_semver_tuple(right)
+    if left_tuple is None or right_tuple is None:
+        return None
+    if left_tuple < right_tuple:
+        return -1
+    if left_tuple > right_tuple:
+        return 1
+    return 0
+
+
+def _exact_version_or_none(spec: str) -> str | None:
+    cleaned = spec.strip()
+    if _EXACT_SEMVER_RE.match(cleaned):
+        return cleaned
+    return None
+
+
+def _is_comparator_expression(spec: str) -> bool:
+    cleaned = spec.strip()
+    tokens = [token for token in re.split(r"[ ,]+", cleaned) if token]
+    if not tokens:
+        return False
+    return all(token[:2] in {">=", "<=", "!=", "==", "~="} or token[:1] in {">", "<", "="} for token in tokens)
+
+
+def _npm_range_contains_exact(range_spec: str, exact_version: str) -> bool:
+    cleaned = range_spec.strip()
+    exact_tuple = _parse_semver_tuple(exact_version)
+    if exact_tuple is None:
+        return False
+
+    if cleaned.startswith("^"):
+        base = cleaned[1:].strip()
+        base_tuple = _parse_semver_tuple(base)
+        if base_tuple is None:
+            return False
+        if base_tuple[0] > 0:
+            return exact_tuple[0] == base_tuple[0] and _compare_semver(exact_version, base) in {0, 1}
+        if base_tuple[1] > 0:
+            return exact_tuple[0] == 0 and exact_tuple[1] == base_tuple[1] and _compare_semver(exact_version, base) in {0, 1}
+        return exact_tuple[0] == 0 and exact_tuple[1] == 0 and exact_tuple[2] >= base_tuple[2]
+
+    if cleaned.startswith("~"):
+        base = cleaned[1:].strip()
+        base_tuple = _parse_semver_tuple(base)
+        if base_tuple is None:
+            return False
+        return (
+            exact_tuple[0] == base_tuple[0]
+            and exact_tuple[1] == base_tuple[1]
+            and _compare_semver(exact_version, base) in {0, 1}
+        )
+
+    if _EXACT_SEMVER_RE.match(cleaned):
+        return cleaned == exact_version
+
+    if _is_comparator_expression(cleaned):
+        parts = [part for part in re.split(r"[ ,]+", cleaned) if part]
+        for token in parts:
+            op = token[:2] if token[:2] in {">=", "<=", "!=", "=="} else token[:1]
+            operand = token[len(op):].strip()
+            cmp_result = _compare_semver(exact_version, operand)
+            if cmp_result is None:
+                return False
+            if op in {"==", "="} and cmp_result != 0:
+                return False
+            if op == "!=" and cmp_result == 0:
+                return False
+            if op == ">=" and cmp_result < 0:
+                return False
+            if op == "<=" and cmp_result > 0:
+                return False
+            if op == ">" and cmp_result <= 0:
+                return False
+            if op == "<" and cmp_result >= 0:
+                return False
+        return True
+
+    return False
+
+
+def _normalize_npm_update_spec(existing_spec: str | None, requested_spec: str) -> str:
+    requested = requested_spec.strip()
+    if not requested:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Dependency version must not be empty",
+        )
+
+    if existing_spec is None:
+        return requested
+
+    current = existing_spec.strip()
+    requested_exact = _exact_version_or_none(requested)
+
+    if current.startswith("^") and requested_exact:
+        base = current[1:].strip()
+        base_tuple = _parse_semver_tuple(base)
+        requested_tuple = _parse_semver_tuple(requested_exact)
+        if base_tuple and requested_tuple and base_tuple[0] == requested_tuple[0]:
+            return f"^{requested_exact}"
+
+    if current.startswith("~") and requested_exact:
+        base = current[1:].strip()
+        base_tuple = _parse_semver_tuple(base)
+        requested_tuple = _parse_semver_tuple(requested_exact)
+        if base_tuple and requested_tuple and base_tuple[0] == requested_tuple[0] and base_tuple[1] == requested_tuple[1]:
+            return f"~{requested_exact}"
+
+    return requested
+
+
+def _ensure_npm_update_is_compatible(
+    package_name: str,
+    existing_spec: str | None,
+    requested_spec: str,
+) -> None:
+    if existing_spec is None:
+        return
+
+    current = existing_spec.strip()
+    requested = requested_spec.strip()
+    requested_exact = _exact_version_or_none(requested)
+
+    if requested_exact is None:
+        if requested == current:
+            return
+        # For non-exact requested ranges we cannot prove compatibility in a robust way.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Unsafe npm update for {package_name}: backend cannot verify compatibility "
+                f"for non-exact requested spec '{requested}' against existing constraint '{current}'"
+            ),
+        )
+
+    if _npm_range_contains_exact(current, requested_exact):
+        return
+
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail=(
+            f"Unsafe npm update for {package_name}: requested version {requested_exact} "
+            f"is incompatible with existing constraint '{current}'"
+        ),
+    )
+
+
+def _extract_requirement_spec_from_line(raw_line: str) -> str | None:
+    match = _REQ_SPEC_RE.match(raw_line)
+    if not match:
+        return None
+    spec = match.group(1)
+    if not isinstance(spec, str):
+        return None
+    cleaned = spec.strip()
+    return cleaned or None
+
+
+def _pypi_requirement_contains_exact(existing_spec: str, exact_version: str) -> bool:
+    tokens = _COMPARATOR_TOKEN_RE.findall(existing_spec)
+    if not tokens:
+        return False
+    for op, operand in tokens:
+        cmp_result = _compare_semver(exact_version, operand)
+        if cmp_result is None:
+            return False
+        if op == "==" and cmp_result != 0:
+            return False
+        if op == "!=" and cmp_result == 0:
+            return False
+        if op == ">=" and cmp_result < 0:
+            return False
+        if op == "<=" and cmp_result > 0:
+            return False
+        if op == ">" and cmp_result <= 0:
+            return False
+        if op == "<" and cmp_result >= 0:
+            return False
+        if op == "~=":
+            base_tuple = _parse_semver_tuple(operand)
+            candidate_tuple = _parse_semver_tuple(exact_version)
+            if base_tuple is None or candidate_tuple is None:
+                return False
+            if candidate_tuple[0] != base_tuple[0]:
+                return False
+            if _compare_semver(exact_version, operand) == -1:
+                return False
+    return True
+
+
+def _normalize_pypi_update_spec(existing_spec: str | None, requested_spec: str) -> str:
+    requested = requested_spec.strip()
+    if existing_spec is None:
+        return requested
+
+    requested_exact = _exact_version_or_none(requested)
+    if requested_exact is None:
+        return requested
+
+    tokens = _COMPARATOR_TOKEN_RE.findall(existing_spec)
+    if len(tokens) == 1 and tokens[0][0] in {"==", "~=", ">=", "<=", ">", "<"}:
+        operator = tokens[0][0]
+        return f"{operator}{requested_exact}"
+
+    if existing_spec.startswith("=="):
+        return f"=={requested_exact}"
+
+    return f"=={requested_exact}"
+
+
+def _ensure_pypi_update_is_compatible(
+    package_name: str,
+    existing_spec: str | None,
+    requested_spec: str,
+) -> None:
+    if existing_spec is None:
+        return
+
+    requested = requested_spec.strip()
+    if requested == existing_spec.strip():
+        return
+
+    requested_exact = _exact_version_or_none(requested)
+    if requested_exact is None:
+        # For explicit comparator/range inputs, let caller preserve that exact intent.
+        return
+
+    existing_clean = existing_spec.strip()
+    if existing_clean.startswith("=="):
+        pinned = existing_clean[2:].strip()
+        pinned_tuple = _parse_semver_tuple(pinned)
+        requested_tuple = _parse_semver_tuple(requested_exact)
+        if pinned_tuple is not None and requested_tuple is not None and pinned_tuple[0] == requested_tuple[0]:
+            return
+
+    if _pypi_requirement_contains_exact(existing_spec, requested_exact):
+        return
+
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail=(
+            f"Unsafe PyPI update for {package_name}: requested version {requested_exact} "
+            f"is incompatible with existing requirement '{existing_spec}'"
+        ),
+    )
 
 
 def _extract_lockfile_direct_deps(parsed_lockfile: dict) -> dict[str, str]:
@@ -601,6 +863,7 @@ def _build_updated_requirements_txt(
     dependencies: list[DependencySpec],
 ) -> str:
     lines = requirements_content.splitlines()
+    deps_by_name = {dep.name.lower(): dep for dep in dependencies}
     updates: dict[str, str] = {}
     order: list[str] = []
     for dep in dependencies:
@@ -626,6 +889,13 @@ def _build_updated_requirements_txt(
         if pkg_name not in updates:
             out_lines.append(raw_line)
             continue
+
+        dep = deps_by_name[pkg_name]
+        existing_spec = _extract_requirement_spec_from_line(raw_line)
+        if existing_spec is not None:
+            _ensure_pypi_update_is_compatible(dep.name, existing_spec, dep.version)
+        normalized_spec = _normalize_pypi_update_spec(existing_spec, dep.version)
+        updates[pkg_name] = f"{dep.name}{normalized_spec}" if normalized_spec.startswith(("==", "!=", "~=", ">=", "<=", ">", "<")) else _render_pypi_requirement(dep)
 
         if pkg_name in consumed:
             # Remove duplicate entries for same package by keeping first replacement.

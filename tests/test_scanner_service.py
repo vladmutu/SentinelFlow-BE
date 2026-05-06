@@ -6,6 +6,7 @@ import json
 import os
 import tarfile
 import tempfile
+import zipfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -151,3 +152,25 @@ def test_classify_missing_model():
 
     assert verdict.malware_status == "error"
     assert "not found" in verdict.error_message.lower()
+
+
+def test_classify_rejects_zip_path_traversal():
+    """Path traversal entries in archives should be blocked by extraction guardrails."""
+    mock_classifier = MagicMock()
+    mock_classifier.predict_proba.return_value = np.array([[0.8, 0.2]])
+
+    with tempfile.TemporaryDirectory(prefix="sentinel_test_") as td:
+        p = Path(td)
+        archive_path = p / "malicious.zip"
+        with zipfile.ZipFile(archive_path, "w") as zf:
+            zf.writestr("../escape.js", "console.log('escape')")
+
+        with (
+            patch("app.services.scanner_service._classifier", mock_classifier),
+            patch("app.services.scanner_service._threshold", 0.5),
+        ):
+            verdict = classify(archive_path)
+
+    assert verdict.malware_status == "error"
+    assert verdict.error_message is not None
+    assert "GUARDRAIL_PATH_TRAVERSAL" in verdict.error_message

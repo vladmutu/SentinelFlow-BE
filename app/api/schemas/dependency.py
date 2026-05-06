@@ -83,6 +83,10 @@ class AddDependencyResponse(BaseModel):
     branch_name: str
     status: str = "pending_review"
     message: str = "Dependency update pull request created"
+    typosquat_warnings: list[dict] = Field(
+        default_factory=list,
+        description="Typosquatting warnings for dependencies that passed but raised concerns.",
+    )
 
 
 class TyposquatSignal(BaseModel):
@@ -115,6 +119,8 @@ class PackageSearchResponse(BaseModel):
 
     ecosystem: str = Field(..., pattern=r"^(npm|pypi)$")
     query: str
+    page: int = 1
+    limit: int = 8
     total: int
     results: list[PackageSearchResult]
     did_you_mean: str | None = None

@@ -228,6 +228,46 @@ def test_build_updated_requirements_txt_updates_and_appends_entries():
     assert "# comment" in updated
 
 
+def test_build_updated_package_json_preserves_caret_constraint_when_safe():
+    package_json = '{"dependencies":{"lodash":"^4.17.20"}}'
+    deps = [DependencySpec(name="lodash", version="4.17.21")]
+
+    updated = pr_creator._build_updated_package_json(package_json, deps)
+
+    assert '"lodash": "^4.17.21"' in updated
+
+
+def test_build_updated_package_json_rejects_major_breaking_update():
+    package_json = '{"dependencies":{"lodash":"^4.17.20"}}'
+    deps = [DependencySpec(name="lodash", version="5.0.0")]
+
+    with pytest.raises(HTTPException) as exc:
+        pr_creator._build_updated_package_json(package_json, deps)
+
+    assert exc.value.status_code == 400
+    assert "Unsafe npm update" in str(exc.value.detail)
+
+
+def test_build_updated_requirements_txt_preserves_tilde_equal_constraint():
+    existing = "requests~=2.30.0\n"
+    deps = [DependencySpec(name="requests", version="2.31.0")]
+
+    updated = pr_creator._build_updated_requirements_txt(existing, deps)
+
+    assert "requests~=2.31.0" in updated
+
+
+def test_build_updated_requirements_txt_rejects_upper_bound_break():
+    existing = "requests>=2.30,<3.0\n"
+    deps = [DependencySpec(name="requests", version="3.1.0")]
+
+    with pytest.raises(HTTPException) as exc:
+        pr_creator._build_updated_requirements_txt(existing, deps)
+
+    assert exc.value.status_code == 400
+    assert "Unsafe PyPI update" in str(exc.value.detail)
+
+
 @pytest.mark.asyncio
 async def test_create_pypi_dependency_pr_returns_existing_pr_for_idempotency(monkeypatch):
     async def _default_branch(*args, **kwargs):

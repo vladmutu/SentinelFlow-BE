@@ -65,6 +65,42 @@ async def test_search_npm_packages_parses_registry_payload():
 
 
 @pytest.mark.asyncio
+async def test_search_npm_packages_uses_page_and_limit():
+    payload = {
+        "objects": [
+            {
+                "package": {
+                    "name": "lodash",
+                    "version": "4.17.21",
+                    "description": "Lodash modular utilities.",
+                    "links": {
+                        "npm": "https://www.npmjs.com/package/lodash",
+                        "homepage": "https://lodash.com",
+                    },
+                },
+                "score": {"final": 0.98},
+            }
+        ]
+    }
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/-/v1/search"):
+            assert request.url.params["size"] == "5"
+            assert request.url.params["from"] == "5"
+            return httpx.Response(200, content=json.dumps(payload), headers={"Content-Type": "application/json"})
+        if request.url.path.endswith("/downloads/point/last-month/lodash"):
+            return httpx.Response(200, content=json.dumps({"downloads": 580261537}), headers={"Content-Type": "application/json"})
+        return httpx.Response(404, content="{}", headers={"Content-Type": "application/json"})
+
+    transport = httpx.MockTransport(_handler)
+    async with httpx.AsyncClient(transport=transport) as client:
+        results = await package_fetcher.search_npm_packages("lodash", page=2, limit=5, client=client)
+
+    assert len(results) == 1
+    assert results[0]["name"] == "lodash"
+
+
+@pytest.mark.asyncio
 async def test_search_pypi_packages_parses_html_results():
     html = """
     <a class="package-snippet" href="/project/requests/">
@@ -191,6 +227,37 @@ async def test_search_pypi_packages_falls_back_to_exact_json_lookup():
     assert results[0]["name"] == "requests"
     assert results[0]["version"] == "2.32.0"
     assert results[0]["monthly_downloads"] == 1385411770
+
+
+@pytest.mark.asyncio
+async def test_search_pypi_packages_uses_page_and_limit():
+    libraries_payload = [
+        {
+            "name": "requests",
+            "latest_release_number": "2.32.0",
+            "description": "HTTP for Humans.",
+            "homepage": "https://requests.readthedocs.io",
+        }
+        for _ in range(8)
+    ]
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/search":
+            assert request.url.params["page"] == "3"
+            assert request.url.params["per_page"] == "8"
+            return httpx.Response(200, content=json.dumps(libraries_payload), headers={"Content-Type": "application/json"})
+        if request.url.path == "/api/pypi/requests":
+            return httpx.Response(200, content=json.dumps(libraries_payload[0]), headers={"Content-Type": "application/json"})
+        if request.url.path == "/api/packages/requests/recent":
+            return httpx.Response(200, content=json.dumps({"data": {"last_month": 1385411770}}), headers={"Content-Type": "application/json"})
+        return httpx.Response(404, content="{}", headers={"Content-Type": "application/json"})
+
+    transport = httpx.MockTransport(_handler)
+    async with httpx.AsyncClient(transport=transport) as client:
+        results = await package_fetcher.search_pypi_packages("requests", page=3, limit=8, client=client)
+
+    assert len(results) == 8
+    assert results[0]["name"] == "requests"
 
 
 @pytest.mark.asyncio

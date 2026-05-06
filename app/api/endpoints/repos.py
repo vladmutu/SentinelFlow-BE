@@ -15,7 +15,7 @@ from app.api.schemas.dependency import (
 from app.core.config import settings
 from app.core.github_app import get_app_jwt
 from app.models.user import User
-from app.services import manifest_utils, package_fetcher, pr_creator
+from app.services import manifest_utils, package_fetcher, pr_creator, typosquat_guard
 
 router = APIRouter(tags=["Repositories"])
 logger = logging.getLogger(__name__)
@@ -150,44 +150,8 @@ def _resolve_v2_tree(dep_name: str, packages: dict, parent_path: str, seen_paths
 
 
 def _build_npm_tree_from_lockfile(lockfile: dict) -> dict:
-    """Build a normalized dependency tree from package-lock content.
-
-    Args:
-        lockfile: Parsed ``package-lock.json`` payload.
-
-    Returns:
-        dict: Tree rooted at the project package.
-    """
-    project_name = lockfile.get("name") or "project"
-    project_version = lockfile.get("version") or "0.0.0"
-
-    packages = lockfile.get("packages")
-    if isinstance(packages, dict) and packages:
-        root_pkg = packages.get("") if isinstance(packages.get(""), dict) else {}
-        if isinstance(root_pkg, dict):
-            project_name = root_pkg.get("name") or project_name
-            project_version = root_pkg.get("version") or project_version
-
-        root_dependencies = root_pkg.get("dependencies", {}) if isinstance(root_pkg, dict) else {}
-        if not isinstance(root_dependencies, dict):
-            root_dependencies = {}
-
-        children = [
-            _resolve_v2_tree(dep_name, packages, "", set())
-            for dep_name in root_dependencies.keys()
-        ]
-        return _simplified_dep(str(project_name), str(project_version), children)
-
-    dependencies = lockfile.get("dependencies", {})
-    if not isinstance(dependencies, dict):
-        dependencies = {}
-
-    children = [
-        _resolve_v1_tree(dep_name, dep_payload, set())
-        for dep_name, dep_payload in dependencies.items()
-        if isinstance(dep_payload, dict)
-    ]
-    return _simplified_dep(str(project_name), str(project_version), children)
+    """Build a normalized dependency tree from package-lock content."""
+    return manifest_utils._resolve_npm_lockfile_tree(lockfile)
 
 
 def _build_tree_from_package_json(package_json: dict) -> dict:
@@ -575,12 +539,53 @@ async def add_dependencies_via_pr(
 
     For npm, updates both ``package.json`` and ``package-lock.json``.
     For pypi, updates ``requirements.txt``.
+
+    Validates all dependencies against typosquatting patterns before
+    creating the PR. High-confidence typosquats are blocked.
     """
     user_headers = {
         "Accept": "application/vnd.github+json",
         "Authorization": f"Bearer {current_user.access_token}",
         "X-GitHub-Api-Version": "2022-11-28",
     }
+
+    # Typosquat validation
+    typosquat_warnings = []
+    try:
+        validations = await typosquat_guard.validate_packages(
+            payload.ecosystem,
+            payload.dependencies,
+        )
+        blocked = [
+            v for v in validations if v.risk_level == "blocked"
+        ]
+        if blocked:
+            blocked_details = "; ".join(
+                f"{v.package_name}: {', '.join(v.reasons)}" for v in blocked
+            )
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Typosquatting risk detected — blocked packages: {blocked_details}",
+            )
+        typosquat_warnings = [
+            {
+                "package_name": v.package_name,
+                "risk_level": v.risk_level,
+                "reasons": v.reasons,
+                "similar_to": v.similar_popular_package,
+                "monthly_downloads": v.monthly_downloads,
+            }
+            for v in validations
+            if v.risk_level == "warning"
+        ]
+    except HTTPException:
+        raise
+    except Exception:
+        logger.warning(
+            "Typosquat validation failed for %s/%s, proceeding without",
+            owner,
+            repo_name,
+        )
 
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -632,6 +637,7 @@ async def add_dependencies_via_pr(
                 pr_url=pr_result.pr_url,
                 pr_number=pr_result.pr_number,
                 branch_name=pr_result.branch_name,
+                typosquat_warnings=typosquat_warnings,
             )
     except httpx.RequestError as exc:
         raise HTTPException(
@@ -647,6 +653,8 @@ async def add_dependencies_via_pr(
 async def search_packages_proxy(
     ecosystem: str = Query(..., pattern=r"^(npm|pypi)$"),
     q: str = Query(..., min_length=1, max_length=128),
+    page: int = Query(1, ge=1, le=10000),
+    limit: int = Query(8, ge=1, le=50),
     authenticated_user_id: object = Depends(require_authenticated_token),
 ) -> PackageSearchResponse:
     """Proxy package search to npm/PyPI and add typosquatting hints.
@@ -662,6 +670,8 @@ async def search_packages_proxy(
                 return PackageSearchResponse(
                     ecosystem=ecosystem,
                     query="",
+                    page=page,
+                    limit=limit,
                     total=0,
                     results=[],
                     did_you_mean=None,
@@ -669,11 +679,15 @@ async def search_packages_proxy(
             if ecosystem == "npm":
                 results = await package_fetcher.search_npm_packages(
                     cleaned_query,
+                    page=page,
+                    limit=limit,
                     client=client,
                 )
             else:
                 results = await package_fetcher.search_pypi_packages(
                     cleaned_query,
+                    page=page,
+                    limit=limit,
                     client=client,
                 )
 
@@ -686,6 +700,8 @@ async def search_packages_proxy(
         return PackageSearchResponse(
             ecosystem=ecosystem,
             query=cleaned_query,
+            page=page,
+            limit=limit,
             total=len(results),
             results=results,
             did_you_mean=suggestion,
@@ -696,6 +712,8 @@ async def search_packages_proxy(
             return PackageSearchResponse(
                 ecosystem=ecosystem,
                 query=q.strip(),
+                page=page,
+                limit=limit,
                 total=0,
                 results=[],
                 did_you_mean=None,

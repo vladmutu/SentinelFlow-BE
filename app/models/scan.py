@@ -3,7 +3,7 @@
 from datetime import datetime, timezone
 from uuid import UUID, uuid4
 
-from sqlalchemy import DateTime, Float, ForeignKey, Index, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -67,6 +67,14 @@ class ScanResult(Base):
         String(50), nullable=False, default="unknown",
     )  # clean | malicious | error | unknown
     malware_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    risk_assessment: Mapped[dict[str, object] | None] = mapped_column(JSON, nullable=True)
+    risk_breakdown: Mapped[dict[str, object] | None] = mapped_column(JSON, nullable=True)
+    advisory_references: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    risk_allowlisted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    risk_suppressed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    risk_suppression_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    analysis_status: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    analysis_coverage: Mapped[str | None] = mapped_column(String(50), nullable=True)
     scanner_version: Mapped[str] = mapped_column(String(100), nullable=False, default="1.0.0")
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     scan_timestamp: Mapped[datetime] = mapped_column(
@@ -100,6 +108,7 @@ class ScanTask(Base):
     status: Mapped[str] = mapped_column(
         String(50), nullable=False, default="pending",
     )  # pending → downloading → analyzing → classifying → done | failed
+    dependency_context: Mapped[dict[str, object] | None] = mapped_column(JSON, nullable=True)
     malware_score: Mapped[float | None] = mapped_column(Float, nullable=True)
     malware_status: Mapped[str | None] = mapped_column(String(50), nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)

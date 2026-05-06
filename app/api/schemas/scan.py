@@ -5,6 +5,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field
 
+from app.api.schemas.risk import PackageRiskAssessment
+
 
 # ── Requests ───────────────────────────────────────────────────────────
 class ScanTriggerRequest(BaseModel):
@@ -36,6 +38,16 @@ class ScanResultResponse(BaseModel):
     scanner_version: str
     error_message: str | None = None
     scan_timestamp: datetime
+    risk_assessment: PackageRiskAssessment | None = None
+    risk_breakdown: dict[str, object] | None = None
+    risk_overall_status: str | None = None
+    risk_overall_score: float | None = None
+    risk_allowlisted: bool = False
+    risk_suppressed: bool = False
+    risk_suppression_reason: str | None = None
+    analysis_status: str | None = None
+    analysis_coverage: str | None = None
+    advisory_references: list[str] = Field(default_factory=list)
 
     model_config = {"from_attributes": True}
 
@@ -59,7 +71,7 @@ class ScanJobResponse(BaseModel):
     started_at: datetime | None = None
     completed_at: datetime | None = None
     created_at: datetime
-    results: list[ScanResultResponse] = []
+    results: list[ScanResultResponse] = Field(default_factory=list)
 
     model_config = {"from_attributes": True}
 
@@ -76,5 +88,15 @@ class ScanResultMapEntry(BaseModel):
     malware_score: float | None = None
     scan_timestamp: datetime
     scanner_version: str
+    risk_assessment: PackageRiskAssessment | None = None
+    risk_breakdown: dict[str, object] | None = None
+    risk_overall_status: str | None = None
+    risk_overall_score: float | None = None
+    risk_allowlisted: bool = False
+    risk_suppressed: bool = False
+    risk_suppression_reason: str | None = None
+    analysis_status: str | None = None
+    analysis_coverage: str | None = None
+    advisory_references: list[str] = Field(default_factory=list)
 
     model_config = {"from_attributes": True}

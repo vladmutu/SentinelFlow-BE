@@ -18,3 +18,5 @@ joblib==1.4.2
 numpy==1.26.4
 pandas==2.2.2
 esprima==4.0.1
+# Webhook development (ngrok tunneling)
+pyngrok==7.2.2

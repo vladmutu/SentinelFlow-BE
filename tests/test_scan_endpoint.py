@@ -207,6 +207,33 @@ async def test_get_scan_job_returns_results(app, mock_db):
     mock_result.ecosystem = "npm"
     mock_result.malware_status = "clean"
     mock_result.malware_score = 0.05
+    mock_result.risk_assessment = {
+        "schema_version": "2026-04-20",
+        "package_name": "lodash",
+        "package_version": "4.17.21",
+        "ecosystem": "npm",
+        "overall_status": "clean",
+        "overall_score": 0.05,
+        "confidence": 0.05,
+        "analysis_mode": "static-classifier",
+        "allowlisted": False,
+        "suppressed": False,
+        "static_signals": [],
+        "dynamic_signals": [],
+        "vulnerability_signals": [],
+        "reputation_signals": [],
+        "policy_signals": [],
+        "evidence": [],
+        "explanation": "Static classifier score 0.050000 for lodash@4.17.21",
+        "metadata": {"scanner_version": "1.0.0"},
+    }
+    mock_result.risk_breakdown = {"classifier": {"score": 0.05, "weight": 1.0}}
+    mock_result.advisory_references = ["GHSA-1234"]
+    mock_result.risk_allowlisted = True
+    mock_result.risk_suppressed = False
+    mock_result.risk_suppression_reason = None
+    mock_result.analysis_status = "skipped"
+    mock_result.analysis_coverage = "none"
     mock_result.scanner_version = "1.0.0"
     mock_result.error_message = None
     mock_result.scan_timestamp = now
@@ -231,6 +258,11 @@ async def test_get_scan_job_returns_results(app, mock_db):
     assert len(body["results"]) == 1
     assert body["results"][0]["package_name"] == "lodash"
     assert body["results"][0]["malware_status"] == "clean"
+    assert body["results"][0]["risk_breakdown"] == {"classifier": {"score": 0.05, "weight": 1.0}}
+    assert body["results"][0]["advisory_references"] == ["GHSA-1234"]
+    assert body["results"][0]["risk_allowlisted"] is True
+    assert body["results"][0]["analysis_status"] == "skipped"
+    assert body["results"][0]["risk_assessment"]["overall_status"] == "clean"
     assert body["progress_percent"] == 100.0
     assert body["estimated_seconds_remaining"] == 0
 

@@ -11,18 +11,25 @@ import asyncio
 import logging
 import shutil
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import UUID
 
 import httpx
-from sqlalchemy import and_, case, select, update
+from sqlalchemy import and_, case, desc, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.db.session import AsyncSessionLocal
 from app.models.scan import ScanJob, ScanResult, ScanTask
-from app.services import manifest_utils, package_fetcher, scanner_service
+from app.services import (
+    dynamic_analysis_service,
+    manifest_utils,
+    package_fetcher,
+    reputation_service,
+    scanner_service,
+    vulnerability_service,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -61,24 +68,16 @@ async def run_scan_job(
             async with httpx.AsyncClient(timeout=30.0) as client:
                 if ecosystem == "npm":
                     manifest = await manifest_utils.fetch_npm_manifest(client, owner, repo, headers)
-                    from app.api.endpoints.repos import (
-                        _build_npm_tree_from_lockfile,
-                        _build_tree_from_package_json,
-                    )
-
-                    if "lockfileVersion" in manifest or "packages" in manifest or "dependencies" in manifest:
-                        tree = _build_npm_tree_from_lockfile(manifest)
-                    else:
-                        tree = _build_tree_from_package_json(manifest)
-
+                    tree = await manifest_utils.resolve_npm_dependency_tree(client, manifest)
                     workload = manifest_utils.build_npm_scan_workload(manifest, tree)
                     packages = workload.refs
                     total_dependency_nodes = workload.total_dependency_nodes
                     total_unique_packages = workload.unique_packages
                 elif ecosystem == "pypi":
                     manifest = await manifest_utils.fetch_pypi_manifest(client, owner, repo, headers)
-                    packages = manifest_utils.flatten_pypi_manifest(manifest)
-                    total_dependency_nodes = len(packages)
+                    tree = await manifest_utils.build_pypi_dependency_tree_deep(client, manifest)
+                    packages = manifest_utils.flatten_dependencies(tree)
+                    total_dependency_nodes = manifest_utils.count_dependency_nodes(tree)
                     total_unique_packages = len(packages)
                 else:
                     raise ValueError(f"Unsupported ecosystem: {ecosystem}")
@@ -117,6 +116,7 @@ async def run_scan_job(
                     package_version=ref.version,
                     ecosystem=ecosystem,
                     status=_TASK_PENDING,
+                    dependency_context=ref.resolution,
                 )
                 for ref in packages
             ]
@@ -243,6 +243,9 @@ async def _scan_single_package(task_id: UUID) -> None:
         await _set_task_status(task_id, _TASK_DONE)
         return
 
+    if await _try_reuse_recent_scan_result(task_id, task):
+        return
+
     tmp_dir = Path(tempfile.mkdtemp(prefix="sentinel_pkg_"))
     try:
         await _set_task_status(task_id, _TASK_DOWNLOADING)
@@ -269,25 +272,267 @@ async def _scan_single_package(task_id: UUID) -> None:
 
         await _set_task_status(task_id, _TASK_ANALYZING)
         try:
-            features = await asyncio.to_thread(scanner_service.extract_features, artifact_path)
+            verdict = await scanner_service.analyze_package_static(
+                task.ecosystem,
+                task.package_name,
+                task.package_version,
+                artifact_path,
+            )
         except Exception as exc:
-            await _set_task_failed(task_id, f"Feature extraction failed: {exc}")
+            await _set_task_failed(task_id, f"Static analysis failed: {exc}")
             return
 
         await _set_task_status(task_id, _TASK_CLASSIFYING)
-        verdict = await asyncio.to_thread(scanner_service.classify_features, features)
+        dependency_context = getattr(task, "dependency_context", None)
+        vulnerability_result = await vulnerability_service.lookup_package_vulnerabilities(
+            task.ecosystem,
+            task.package_name,
+            task.package_version,
+        )
+
+        preliminary_priority = _estimate_dynamic_priority_score(verdict, vulnerability_result)
+        if _should_run_dynamic_analysis(preliminary_priority, verdict, vulnerability_result):
+            dynamic_result = await dynamic_analysis_service.analyze_package_dynamically(
+                task.ecosystem,
+                task.package_name,
+                task.package_version,
+                artifact_path,
+            )
+        else:
+            dynamic_result = dynamic_analysis_service.build_skipped_dynamic_result(
+                "priority_filtered",
+                detail=f"preliminary_score={preliminary_priority:.6f}",
+            )
+
+        # Reputation lookup
+        try:
+            reputation_result = await reputation_service.lookup_package_reputation(
+                task.ecosystem,
+                task.package_name,
+                task.package_version,
+            )
+        except Exception:
+            logger.warning(
+                "Reputation lookup failed for %s@%s, proceeding without",
+                task.package_name,
+                task.package_version,
+            )
+            reputation_result = reputation_service.ReputationLookupResult(
+                signals=[], evidence=[], metadata={"error": "lookup_failed"}
+            )
 
         if verdict.malware_status == "error":
-            await _set_task_failed(task_id, verdict.error_message or "Classifier returned error")
+            risk_assessment = scanner_service.build_package_risk_assessment(
+                task.package_name,
+                task.package_version,
+                task.ecosystem,
+                verdict,
+                dependency_context=dependency_context,
+                dynamic_signals=dynamic_result.signals,
+                dynamic_evidence=dynamic_result.evidence,
+                dynamic_metadata=dynamic_result.metadata,
+                vulnerability_signals=vulnerability_result.signals,
+                advisory_references=vulnerability_result.advisory_references,
+                vulnerability_evidence=vulnerability_result.evidence,
+                vulnerability_metadata=vulnerability_result.metadata,
+                reputation_signals=reputation_result.signals,
+                reputation_evidence=reputation_result.evidence,
+                reputation_metadata=reputation_result.metadata,
+            )
+            await _set_task_failed(
+                task_id,
+                verdict.error_message or "Classifier returned error",
+                risk_assessment=risk_assessment,
+            )
             return
 
-        await _set_task_done(task_id, verdict)
+        risk_assessment = scanner_service.build_package_risk_assessment(
+            task.package_name,
+            task.package_version,
+            task.ecosystem,
+            verdict,
+            dependency_context=dependency_context,
+            dynamic_signals=dynamic_result.signals,
+            dynamic_evidence=dynamic_result.evidence,
+            dynamic_metadata=dynamic_result.metadata,
+            vulnerability_signals=vulnerability_result.signals,
+            advisory_references=vulnerability_result.advisory_references,
+            vulnerability_evidence=vulnerability_result.evidence,
+            vulnerability_metadata=vulnerability_result.metadata,
+            reputation_signals=reputation_result.signals,
+            reputation_evidence=reputation_result.evidence,
+            reputation_metadata=reputation_result.metadata,
+        )
+        await _set_task_done(task_id, verdict, risk_assessment=risk_assessment)
 
     except Exception as exc:
         logger.exception("Task %s failed", task_id)
         await _set_task_failed(task_id, str(exc))
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _max_vulnerability_risk(vulnerability_result: object) -> float:
+    signals = getattr(vulnerability_result, "signals", None)
+    if not isinstance(signals, list):
+        return 0.0
+
+    max_score = 0.0
+    for signal in signals:
+        signal_name = getattr(signal, "name", None)
+        value = getattr(signal, "value", None)
+        if signal_name != "vulnerability_detected":
+            continue
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)):
+            max_score = max(max_score, max(0.0, min(float(value) / 10.0, 1.0)))
+    return max_score
+
+
+def _estimate_dynamic_priority_score(
+    verdict: scanner_service.ScanVerdict,
+    vulnerability_result: object,
+) -> float:
+    classifier_score = verdict.malware_score if isinstance(verdict.malware_score, (int, float)) else 0.0
+    vulnerability_score = _max_vulnerability_risk(vulnerability_result)
+    return max(classifier_score, vulnerability_score)
+
+
+def _should_run_dynamic_analysis(
+    preliminary_score: float,
+    verdict: scanner_service.ScanVerdict,
+    vulnerability_result: object,
+) -> bool:
+    if not settings.dynamic_analysis_enabled:
+        return True
+
+    if verdict.malware_status == "malicious":
+        return True
+
+    if (
+        settings.dynamic_analysis_force_on_vulnerability
+        and getattr(vulnerability_result, "signals", None)
+    ):
+        return True
+
+    return preliminary_score >= max(0.0, settings.dynamic_analysis_priority_threshold)
+
+
+def _augment_cached_risk_assessment(risk_assessment: object | None, *, source_result_id: UUID) -> object | None:
+    if not isinstance(risk_assessment, dict):
+        return risk_assessment
+
+    payload = dict(risk_assessment)
+    metadata = payload.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    cache_meta = metadata.get("cache")
+    if not isinstance(cache_meta, dict):
+        cache_meta = {}
+    cache_meta.update(
+        {
+            "reused": True,
+            "source_result_id": str(source_result_id),
+            "reused_at": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+    metadata["cache"] = cache_meta
+    payload["metadata"] = metadata
+
+    evidence = payload.get("evidence")
+    if isinstance(evidence, list):
+        if "cache:scan_result_reuse" not in evidence:
+            payload["evidence"] = [*evidence, "cache:scan_result_reuse"]
+    else:
+        payload["evidence"] = ["cache:scan_result_reuse"]
+
+    return payload
+
+
+def _extract_result_risk_fields(risk_assessment: object | None) -> dict[str, object]:
+    payload = _serialize_risk_assessment(risk_assessment)
+    if not isinstance(payload, dict):
+        payload = {}
+
+    metadata = payload.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    scoring = metadata.get("scoring")
+    if not isinstance(scoring, dict):
+        scoring = {}
+
+    dynamic_meta = metadata.get("dynamic")
+    if not isinstance(dynamic_meta, dict):
+        dynamic_meta = {}
+
+    advisory_references = payload.get("advisory_references")
+    if not isinstance(advisory_references, list):
+        advisory_references = []
+
+    risk_breakdown = scoring.get("breakdown")
+    if not isinstance(risk_breakdown, dict):
+        risk_breakdown = None
+
+    return {
+        "risk_breakdown": risk_breakdown,
+        "advisory_references": [str(item) for item in advisory_references if isinstance(item, str)],
+        "risk_allowlisted": bool(payload.get("allowlisted", False)),
+        "risk_suppressed": bool(payload.get("suppressed", False)),
+        "risk_suppression_reason": payload.get("suppression_reason"),
+        "analysis_status": dynamic_meta.get("status") if isinstance(dynamic_meta.get("status"), str) else None,
+        "analysis_coverage": dynamic_meta.get("coverage") if isinstance(dynamic_meta.get("coverage"), str) else None,
+    }
+
+
+async def _find_recent_cached_result(task: ScanTask) -> ScanResult | None:
+    if not settings.scan_result_reuse_enabled:
+        return None
+
+    ttl_seconds = max(0, settings.scan_result_reuse_ttl_seconds)
+    if ttl_seconds <= 0:
+        return None
+
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=ttl_seconds)
+    async with AsyncSessionLocal() as db:
+        stmt = (
+            select(ScanResult)
+            .where(
+                ScanResult.package_name == task.package_name,
+                ScanResult.package_version == task.package_version,
+                ScanResult.ecosystem == task.ecosystem,
+                ScanResult.job_id != task.job_id,
+                ScanResult.malware_status != "error",
+                ScanResult.scan_timestamp >= cutoff,
+            )
+            .order_by(desc(ScanResult.scan_timestamp))
+            .limit(1)
+        )
+        return (await db.execute(stmt)).scalar_one_or_none()
+
+
+async def _try_reuse_recent_scan_result(task_id: UUID, task: ScanTask) -> bool:
+    cached = await _find_recent_cached_result(task)
+    if cached is None:
+        return False
+
+    await _set_task_status(task_id, _TASK_DOWNLOADING)
+    cached_verdict = scanner_service.ScanVerdict(
+        malware_status=cached.malware_status,
+        malware_score=cached.malware_score,
+        scanner_version=cached.scanner_version,
+        error_message=cached.error_message,
+    )
+    await _set_task_done(
+        task_id,
+        cached_verdict,
+        risk_assessment=_augment_cached_risk_assessment(
+            cached.risk_assessment,
+            source_result_id=cached.id,
+        ),
+    )
+    return True
 
 
 async def _is_job_cancelled(job_id: UUID) -> bool:
@@ -322,7 +567,12 @@ async def _set_task_status(task_id: UUID, status: str) -> None:
         await db.commit()
 
 
-async def _set_task_done(task_id: UUID, verdict: scanner_service.ScanVerdict) -> None:
+async def _set_task_done(
+    task_id: UUID,
+    verdict: scanner_service.ScanVerdict,
+    *,
+    risk_assessment: object | None = None,
+) -> None:
     async with AsyncSessionLocal() as db:
         stmt = select(ScanTask).where(ScanTask.id == task_id)
         task = (await db.execute(stmt)).scalar_one_or_none()
@@ -337,12 +587,22 @@ async def _set_task_done(task_id: UUID, verdict: scanner_service.ScanVerdict) ->
         task.updated_at = now
         task.completed_at = now
 
-        await _upsert_result_from_task(db, task, scanner_version=verdict.scanner_version)
+        await _upsert_result_from_task(
+            db,
+            task,
+            scanner_version=verdict.scanner_version,
+            risk_assessment=risk_assessment,
+        )
         await _increment_processed_once(db, task.job_id)
         await db.commit()
 
 
-async def _set_task_failed(task_id: UUID, error_message: str) -> None:
+async def _set_task_failed(
+    task_id: UUID,
+    error_message: str,
+    *,
+    risk_assessment: object | None = None,
+) -> None:
     async with AsyncSessionLocal() as db:
         stmt = select(ScanTask).where(ScanTask.id == task_id)
         task = (await db.execute(stmt)).scalar_one_or_none()
@@ -356,7 +616,12 @@ async def _set_task_failed(task_id: UUID, error_message: str) -> None:
         task.updated_at = now
         task.completed_at = now
 
-        await _upsert_result_from_task(db, task, scanner_version=scanner_service.SCANNER_VERSION)
+        await _upsert_result_from_task(
+            db,
+            task,
+            scanner_version=scanner_service.SCANNER_VERSION,
+            risk_assessment=risk_assessment,
+        )
         await _increment_processed_once(db, task.job_id)
         await db.commit()
 
@@ -366,7 +631,9 @@ async def _upsert_result_from_task(
     task: ScanTask,
     *,
     scanner_version: str,
+    risk_assessment: object | None = None,
 ) -> None:
+    risk_fields = _extract_result_risk_fields(risk_assessment)
     stmt = select(ScanResult).where(
         ScanResult.job_id == task.job_id,
         ScanResult.package_name == task.package_name,
@@ -384,6 +651,14 @@ async def _upsert_result_from_task(
                 ecosystem=task.ecosystem,
                 malware_status=task.malware_status or "unknown",
                 malware_score=task.malware_score,
+                risk_assessment=_serialize_risk_assessment(risk_assessment),
+                risk_breakdown=risk_fields["risk_breakdown"],
+                advisory_references=risk_fields["advisory_references"],
+                risk_allowlisted=bool(risk_fields["risk_allowlisted"]),
+                risk_suppressed=bool(risk_fields["risk_suppressed"]),
+                risk_suppression_reason=risk_fields["risk_suppression_reason"],
+                analysis_status=risk_fields["analysis_status"],
+                analysis_coverage=risk_fields["analysis_coverage"],
                 scanner_version=scanner_version,
                 error_message=task.error_message,
             )
@@ -392,9 +667,28 @@ async def _upsert_result_from_task(
 
     existing.malware_status = task.malware_status or "unknown"
     existing.malware_score = task.malware_score
+    existing.risk_assessment = _serialize_risk_assessment(risk_assessment)
+    existing.risk_breakdown = risk_fields["risk_breakdown"]
+    existing.advisory_references = risk_fields["advisory_references"]
+    existing.risk_allowlisted = bool(risk_fields["risk_allowlisted"])
+    existing.risk_suppressed = bool(risk_fields["risk_suppressed"])
+    existing.risk_suppression_reason = risk_fields["risk_suppression_reason"]
+    existing.analysis_status = risk_fields["analysis_status"]
+    existing.analysis_coverage = risk_fields["analysis_coverage"]
     existing.error_message = task.error_message
     existing.scanner_version = scanner_version
     existing.scan_timestamp = datetime.now(timezone.utc)
+
+
+def _serialize_risk_assessment(risk_assessment: object | None) -> dict[str, object] | None:
+    if risk_assessment is None:
+        return None
+    model_dump = getattr(risk_assessment, "model_dump", None)
+    if callable(model_dump):
+        return model_dump(mode="json")
+    if isinstance(risk_assessment, dict):
+        return risk_assessment
+    raise TypeError(f"Unsupported risk assessment payload: {type(risk_assessment)!r}")
 
 
 async def _increment_processed_once(db: AsyncSession, job_id: UUID) -> None:
