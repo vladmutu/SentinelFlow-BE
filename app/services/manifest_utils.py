@@ -249,7 +249,12 @@ def _parse_requirement_spec(raw_line: str) -> tuple[str, str | None]:
     if not line:
         return "", None
 
-    line = line.split("[", 1)[0].strip()
+    # Strip extras (e.g. [socks]) but keep the version spec that follows.
+    if "[" in line and "]" in line:
+        bracket_start = line.index("[")
+        bracket_end = line.index("]", bracket_start) + 1
+        line = (line[:bracket_start] + line[bracket_end:]).strip()
+
     for separator in ("==", ">=", "<=", "~=", "!=", ">", "<"):
         if separator in line:
             pkg, spec = line.split(separator, 1)

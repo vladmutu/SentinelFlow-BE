@@ -1,16 +1,14 @@
 """Dynamic-analysis microservice integration.
 
-This module delegates all dynamic analysis to a remote microservice.
-It never executes untrusted package code on the API host.
+Delegates all dynamic analysis to a remote microservice.
+Never executes untrusted package code on the API host.
 """
 
 from __future__ import annotations
 
 import asyncio
-import hashlib
 from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
-from pathlib import Path
 import logging
 from urllib.parse import urlparse
 
@@ -115,15 +113,22 @@ def _normalize_remote_response(payload: dict[str, object]) -> DynamicAnalysisRes
     except (TypeError, ValueError):
         risk_score = None
 
-    metadata = {
+    # Capture all rich data from the microservice so it gets persisted in
+    # risk_assessment.metadata.dynamic via the orchestrator's dynamic_metadata.
+    metadata: dict[str, object] = {
         "status": status,
         "coverage": coverage,
         "sandbox_provider": payload.get("provider"),
         "sandbox_job_id": payload.get("job_id"),
         "sandbox_timed_out": bool(payload.get("timed_out", False)),
+        "vm_evasion_observed": bool(payload.get("vm_evasion_observed", False)),
         "executed_on_api_host": False,
         "sandbox_boundary": "remote_only",
         "sandbox_isolation_enforced": True,
+        "syscall_trace": payload.get("syscall_trace"),
+        "network_activity": payload.get("network_activity"),
+        "filesystem_changes": payload.get("filesystem_changes"),
+        "ioc_detail": payload.get("ioc_detail"),
     }
 
     signals: list[RiskSignal] = []
@@ -171,6 +176,21 @@ def _normalize_remote_response(payload: dict[str, object]) -> DynamicAnalysisRes
         )
         evidence.append("dynamic:vm_evasion_observed")
 
+    ioc_detail = payload.get("ioc_detail")
+    if isinstance(ioc_detail, dict) and ioc_detail.get("dynamic_hit"):
+        signals.append(
+            RiskSignal(
+                source="dynamic-analysis",
+                name="dynamic_ioc_hit",
+                value=True,
+                weight=0.8,
+                confidence=0.85,
+                rationale=f"IOC scan verdict: {ioc_detail.get('verdict', 'unknown')}",
+                metadata=metadata,
+            )
+        )
+        evidence.append("dynamic:ioc_hit")
+
     return DynamicAnalysisResult(signals=signals, evidence=evidence, metadata=metadata)
 
 
@@ -178,28 +198,38 @@ async def analyze_package_dynamically(
     ecosystem: str,
     package_name: str,
     package_version: str,
-    artifact_path: Path | None = None,
 ) -> DynamicAnalysisResult:
-    """Delegate dynamic analysis to a remote microservice.
+    """Delegate dynamic analysis to the remote microservice.
 
-    This function never executes the package locally on the API host.
-    Sends only package metadata to the microservice.
+    Never executes the package locally on the API host.
+    Sends only package metadata to POST /analyze on the microservice.
     """
     if not settings.dynamic_analysis_enabled:
+        logger.info("Dynamic analysis disabled (DYNAMIC_ANALYSIS_ENABLED=false); skipping %s@%s", package_name, package_version)
         return _make_skipped_result("disabled")
 
-    url = settings.dynamic_analysis_url.strip()
-    if not url:
+    base_url = settings.dynamic_analysis_remote_url.strip()
+    if not base_url:
+        logger.warning("Dynamic analysis remote URL is empty (DYNAMIC_ANALYSIS_REMOTE_URL not set); skipping %s@%s", package_name, package_version)
         return _make_skipped_result("missing_remote_url")
 
-    parsed = urlparse(url)
+    parsed = urlparse(base_url)
     host = (parsed.hostname or "").lower()
     is_localhost = host in {"localhost", "127.0.0.1", "::1"}
     if parsed.scheme != "https" and not is_localhost:
+        logger.warning(
+            "Dynamic analysis remote URL is not HTTPS and not localhost (scheme=%s, host=%s); skipping %s@%s",
+            parsed.scheme or "none",
+            host,
+            package_name,
+            package_version,
+        )
         return _make_skipped_result(
             "insecure_remote_url",
             detail=f"scheme={parsed.scheme or 'none'}",
         )
+
+    analyze_url = f"{base_url.rstrip('/')}/analyze"
 
     cache_key = (ecosystem.lower(), package_name.lower(), package_version)
     now = datetime.now(timezone.utc)
@@ -211,25 +241,79 @@ async def analyze_package_dynamically(
         "ecosystem": ecosystem,
         "package_name": package_name,
         "package_version": package_version,
+        "sandbox_type": settings.dynamic_analysis_sandbox_type,
     }
 
+    headers: dict[str, str] = {}
+    if settings.dynamic_analysis_api_key:
+        headers["Authorization"] = f"Bearer {settings.dynamic_analysis_api_key}"
+
     timeout = httpx.Timeout(max(2, settings.dynamic_analysis_timeout_seconds))
+
+    logger.info(
+        "Dynamic analysis → POST %s  ecosystem=%s  package=%s@%s  sandbox=%s",
+        analyze_url,
+        ecosystem,
+        package_name,
+        package_version,
+        settings.dynamic_analysis_sandbox_type,
+    )
 
     try:
         semaphore = await _get_dynamic_semaphore()
         async with semaphore:
             async with httpx.AsyncClient(timeout=timeout) as client:
-                response = await client.post(url, json=request_payload)
+                response = await client.post(
+                    analyze_url,
+                    json=request_payload,
+                    headers=headers or None,
+                )
 
         if response.is_error:
-            detail = f"status_code={response.status_code}"
-            result = _make_partial_result("remote_http_error", detail=detail)
-            return result
+            if response.status_code == 503:
+                try:
+                    body = response.json()
+                except Exception:
+                    body = response.text
+                logger.warning(
+                    "Dynamic analysis service not ready for %s@%s (503): %s",
+                    package_name,
+                    package_version,
+                    body,
+                )
+                return _make_skipped_result("service_not_ready")
+
+            try:
+                body = response.json()
+            except Exception:
+                body = response.text
+            logger.error(
+                "Dynamic analysis HTTP error for %s@%s: status=%s  body=%s",
+                package_name,
+                package_version,
+                response.status_code,
+                body,
+            )
+            return _make_partial_result("remote_http_error", detail=f"status_code={response.status_code}")
 
         payload = response.json()
         if not isinstance(payload, dict):
+            logger.error(
+                "Dynamic analysis returned non-dict payload for %s@%s: %r",
+                package_name,
+                package_version,
+                payload,
+            )
             result = _make_partial_result("invalid_remote_payload")
         else:
+            logger.info(
+                "Dynamic analysis completed for %s@%s: status=%s coverage=%s risk_score=%s",
+                package_name,
+                package_version,
+                payload.get("status"),
+                payload.get("coverage"),
+                payload.get("risk_score"),
+            )
             result = _normalize_remote_response(payload)
 
         ttl_seconds = max(30, settings.dynamic_analysis_cache_ttl_seconds)
@@ -240,19 +324,30 @@ async def analyze_package_dynamically(
             )
         return result
 
+    except httpx.ConnectError as exc:
+        logger.error(
+            "Dynamic analysis: cannot connect to %s for %s@%s — is the MicroVMService running? (%s)",
+            analyze_url,
+            package_name,
+            package_version,
+            exc,
+        )
+        return _make_partial_result("remote_exception", detail="ConnectError")
     except httpx.TimeoutException:
+        logger.warning(
+            "Dynamic analysis timed out after %ss for %s@%s (url=%s)",
+            settings.dynamic_analysis_timeout_seconds,
+            package_name,
+            package_version,
+            analyze_url,
+        )
         return _make_partial_result("timeout")
     except Exception as exc:
         logger.warning(
-            "Dynamic analysis microservice error for %s@%s: %s",
+            "Dynamic analysis microservice error for %s@%s: %s — %s",
             package_name,
             package_version,
             exc.__class__.__name__,
+            exc,
         )
         return _make_partial_result("remote_exception", detail=exc.__class__.__name__)
-
-    return DynamicAnalysisResult(
-        signals=[*result.signals, *extra_signals],
-        evidence=[*result.evidence, *extra_evidence],
-        metadata={**result.metadata, "sandbox_type": "firecracker"},
-    )

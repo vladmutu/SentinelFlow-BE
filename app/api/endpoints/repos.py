@@ -1,21 +1,28 @@
+import asyncio
 import base64
 import json
 import logging
+from uuid import UUID
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import get_current_user, require_authenticated_token
+from app.api.deps import get_current_user, get_db, require_authenticated_token
 from app.api.schemas.dependency import (
     AddDependencyRequest,
     AddDependencyResponse,
+    PackageDetailsResponse,
     PackageSearchResponse,
     PackageVersionsResponse,
 )
 from app.core.config import settings
 from app.core.github_app import get_app_jwt
+from app.models.scan import ScanJob
 from app.models.user import User
-from app.services import manifest_utils, package_fetcher, pr_creator, typosquat_guard
+from app.services import manifest_utils, package_fetcher, pr_creator, reputation_service, scanner_service, typosquat_guard
+from app.services.job_runner import job_runner
+from app.services.scan_orchestrator import run_scan_job
 
 router = APIRouter(tags=["Repositories"])
 logger = logging.getLogger(__name__)
@@ -534,6 +541,7 @@ async def add_dependencies_via_pr(
     repo_name: str,
     payload: AddDependencyRequest,
     current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ) -> AddDependencyResponse:
     """Create a pull request that adds or updates dependencies.
 
@@ -587,6 +595,26 @@ async def add_dependencies_via_pr(
             repo_name,
         )
 
+    # Pre-PR security scan: run static analysis on each dependency in parallel.
+    # Block PR creation if any package is confirmed malicious.
+    # Fail-open on scanner errors so a downed scanner never blocks the workflow.
+    scan_verdicts = await asyncio.gather(
+        *[
+            scanner_service.analyze_package_static(payload.ecosystem, dep.name, dep.version)
+            for dep in payload.dependencies
+        ],
+        return_exceptions=True,
+    )
+    for dep, verdict in zip(payload.dependencies, scan_verdicts):
+        if isinstance(verdict, Exception):
+            logger.warning("Pre-PR scan error for %s: %s", dep.name, verdict)
+            continue
+        if verdict.malware_status == "malicious":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Package '{dep.name}@{dep.version}' failed security scan (malicious). PR creation blocked.",
+            )
+
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             active_headers = user_headers
@@ -633,11 +661,45 @@ async def add_dependencies_via_pr(
                     idempotency_key=payload.idempotency_key,
                 )
 
+            # Auto-scan the newly added packages (static + conditional dynamic only)
+            scan_job_id: UUID | None = None
+            try:
+                scan_job = ScanJob(
+                    owner=owner,
+                    repo_name=repo_name,
+                    ecosystem=payload.ecosystem,
+                    status="pending",
+                    scan_mode="static_dynamic",
+                )
+                db.add(scan_job)
+                await db.commit()
+                await db.refresh(scan_job)
+                scan_job_id = scan_job.id
+                job_runner.submit(
+                    run_scan_job(
+                        job_id=scan_job.id,
+                        owner=owner,
+                        repo=repo_name,
+                        ecosystem=payload.ecosystem,
+                        access_token=current_user.access_token,
+                        selected_packages=[dep.name for dep in payload.dependencies],
+                        scan_mode="static_dynamic",
+                    )
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to trigger auto-scan after PR creation for %s/%s",
+                    owner,
+                    repo_name,
+                    exc_info=True,
+                )
+
             return AddDependencyResponse(
                 pr_url=pr_result.pr_url,
                 pr_number=pr_result.pr_number,
                 branch_name=pr_result.branch_name,
                 typosquat_warnings=typosquat_warnings,
+                scan_job_id=scan_job_id,
             )
     except httpx.RequestError as exc:
         raise HTTPException(
@@ -690,6 +752,8 @@ async def search_packages_proxy(
                     limit=limit,
                     client=client,
                 )
+
+        await reputation_service.enrich_search_results(results, ecosystem)
 
         suggestion = package_fetcher.suggest_package_name(
             ecosystem,
@@ -765,3 +829,30 @@ async def get_package_versions_proxy(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="Unable to reach registry API while loading package versions",
         ) from exc
+
+
+@router.get(
+    "/packages/details",
+    response_model=PackageDetailsResponse,
+)
+async def get_package_details(
+    ecosystem: str = Query(..., pattern=r"^(npm|pypi)$"),
+    name: str = Query(..., min_length=1, max_length=214),
+    version: str | None = Query(default=None),
+    current_user: User = Depends(get_current_user),
+) -> PackageDetailsResponse:
+    """Fetch rich metadata for a single npm or PyPI package."""
+    del current_user
+    try:
+        details = await reputation_service.fetch_package_details(ecosystem, name, version)
+        return PackageDetailsResponse.model_validate(details)
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Package not found: {name}",
+        )
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Failed to fetch package details from upstream registries",
+        )

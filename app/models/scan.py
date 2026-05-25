@@ -19,6 +19,7 @@ class ScanJob(Base):
     owner: Mapped[str] = mapped_column(String(255), nullable=False)
     repo_name: Mapped[str] = mapped_column(String(255), nullable=False)
     ecosystem: Mapped[str] = mapped_column(String(50), nullable=False)  # "npm" | "pypi"
+    scan_mode: Mapped[str] = mapped_column(String(50), nullable=False, server_default="full")  # full | static_only | static_dynamic | dynamic_only
     status: Mapped[str] = mapped_column(
         String(50), nullable=False, default="pending",
     )  # pending → running → completed | failed

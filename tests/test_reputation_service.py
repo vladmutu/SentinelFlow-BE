@@ -148,3 +148,118 @@ class TestReputationLookup:
         result = await _fetch_npm_reputation(mock_client, "test", "1.0.0")
         assert isinstance(result, ReputationLookupResult)
         assert result.metadata.get("registry_error") == 503
+
+
+class TestLibrariesIoEnrichment:
+    """Tests for Libraries.io enrichment gating and rate limiting."""
+
+    @pytest.mark.asyncio
+    async def test_librariesio_skipped_for_transitive(self):
+        """Libraries.io enrichment is NOT called for transitive (non-direct) deps."""
+        with (
+            patch("app.services.reputation_service.settings") as mock_settings,
+            patch(
+                "app.services.reputation_service._fetch_npm_reputation",
+                new_callable=AsyncMock,
+            ) as mock_npm,
+            patch(
+                "app.services.reputation_service._enrich_from_librariesio",
+                new_callable=AsyncMock,
+            ) as mock_enrich,
+        ):
+            mock_settings.reputation_lookup_enabled = True
+            mock_settings.reputation_lookup_timeout_seconds = 5
+            mock_settings.reputation_cache_ttl_seconds = 60
+            mock_npm.return_value = ReputationLookupResult(
+                signals=[], evidence=[], metadata={"source": "npm"}
+            )
+
+            from app.services.reputation_service import lookup_package_reputation
+
+            result = await lookup_package_reputation(
+                "npm",
+                "pkg-transitive-skip-test-unique-1",
+                "1.0.0",
+                is_direct_dependency=False,
+            )
+
+        mock_enrich.assert_not_called()
+        assert "trust_score" not in result.metadata
+
+    @pytest.mark.asyncio
+    async def test_librariesio_called_for_direct(self):
+        """Libraries.io enrichment IS called and trust_score is present for direct deps."""
+        enriched = ReputationLookupResult(
+            signals=[],
+            evidence=[],
+            metadata={"source": "npm", "trust_score": 0.75},
+        )
+
+        with (
+            patch("app.services.reputation_service.settings") as mock_settings,
+            patch(
+                "app.services.reputation_service._fetch_npm_reputation",
+                new_callable=AsyncMock,
+            ) as mock_npm,
+            patch(
+                "app.services.reputation_service._enrich_from_librariesio",
+                new_callable=AsyncMock,
+            ) as mock_enrich,
+        ):
+            mock_settings.reputation_lookup_enabled = True
+            mock_settings.reputation_lookup_timeout_seconds = 5
+            mock_settings.reputation_cache_ttl_seconds = 60
+            mock_npm.return_value = ReputationLookupResult(
+                signals=[], evidence=[], metadata={"source": "npm"}
+            )
+            mock_enrich.return_value = enriched
+
+            from app.services.reputation_service import lookup_package_reputation
+
+            result = await lookup_package_reputation(
+                "npm",
+                "pkg-direct-enrich-test-unique-1",
+                "2.0.0",
+                is_direct_dependency=True,
+            )
+
+        mock_enrich.assert_called_once()
+        assert result.metadata.get("trust_score") == 0.75
+
+    @pytest.mark.asyncio
+    async def test_librariesio_rate_limit(self):
+        """Second call within 1-second window delays via asyncio.sleep."""
+        import asyncio
+        import httpx
+        import app.services.reputation_service as rep_svc
+        from app.services.reputation_service import _enrich_from_librariesio
+
+        # Simulate that libraries.io was called 0.1 seconds ago (well within the 1.0s limit).
+        rep_svc._librariesio_last_called = asyncio.get_event_loop().time() - 0.1
+
+        fake_result = ReputationLookupResult(signals=[], evidence=[], metadata={})
+        mock_client = AsyncMock(spec=httpx.AsyncClient)
+        response = MagicMock()
+        response.is_error = False
+        response.json.return_value = {
+            "rank": 25,
+            "dependents_count": 150,
+            "stars": 1000,
+            "forks": 50,
+            "contributions_count": 10,
+        }
+        mock_client.get = AsyncMock(return_value=response)
+
+        with (
+            patch("app.services.reputation_service.settings") as mock_settings,
+            patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+        ):
+            mock_settings.librariesio_api_key = "test-api-key"
+            await _enrich_from_librariesio(
+                mock_client, "npm", "rate-limit-test-pkg", fake_result
+            )
+
+        mock_sleep.assert_called_once()
+        sleep_duration = mock_sleep.call_args[0][0]
+        # elapsed ≈ 0.1s → sleep should be called with ≈ 0.9s
+        assert 0.5 < sleep_duration <= 1.0

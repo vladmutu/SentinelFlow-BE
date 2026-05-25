@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from uuid import UUID
+
 from pydantic import BaseModel, Field, field_validator
 
 
@@ -87,6 +89,10 @@ class AddDependencyResponse(BaseModel):
         default_factory=list,
         description="Typosquatting warnings for dependencies that passed but raised concerns.",
     )
+    scan_job_id: UUID | None = Field(
+        default=None,
+        description="Auto-triggered static+dynamic scan job ID, if scan was successfully enqueued.",
+    )
 
 
 class TyposquatSignal(BaseModel):
@@ -112,6 +118,25 @@ class PackageSearchResult(BaseModel):
     score: float | None = None
     monthly_downloads: int | None = None
     typosquat: TyposquatSignal
+    query_distance: int | None = Field(
+        default=None,
+        description=(
+            "Levenshtein distance between this package name and the user's search query. "
+            "Low values (0-2) indicate a close match; high values suggest an unrelated result."
+        ),
+    )
+    license: str | None = None
+    keywords: list[str] = Field(default_factory=list)
+    latest_version: str | None = None
+    package_age_days: int | None = None
+    maintainer_count: int | None = None
+    has_repository: bool | None = None
+    direct_dependencies_count: int | None = None
+    stars: int | None = None
+    forks: int | None = None
+    contributors_count: int | None = None
+    dependents_count: int | None = None
+    source_rank: int | None = None
 
 
 class PackageSearchResponse(BaseModel):
@@ -133,3 +158,27 @@ class PackageVersionsResponse(BaseModel):
     package_name: str
     latest_version: str | None = None
     versions: list[str]
+
+
+class PackageDetailsResponse(BaseModel):
+    """Rich metadata for a single npm or PyPI package."""
+
+    name: str
+    version: str
+    ecosystem: str
+    description: str | None = None
+    license: str | None = None
+    homepage: str | None = None
+    registry_url: str | None = None
+    keywords: list[str] = Field(default_factory=list)
+    latest_version: str | None = None
+    package_age_days: int | None = None
+    monthly_downloads: int | None = None
+    maintainer_count: int | None = None
+    has_repository: bool | None = None
+    direct_dependencies_count: int | None = None
+    stars: int | None = None
+    forks: int | None = None
+    contributors_count: int | None = None
+    dependents_count: int | None = None
+    source_rank: int | None = None

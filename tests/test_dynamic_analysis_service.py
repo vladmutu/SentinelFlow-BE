@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -19,8 +18,7 @@ async def test_dynamic_analysis_disabled_returns_explicit_skip() -> None:
             "npm",
             "lodash",
             "4.17.21",
-            Path("C:/tmp/lodash.tgz"),
-        )
+                    )
 
     assert result.metadata["status"] == "skipped"
     assert result.metadata["coverage"] == "none"
@@ -35,7 +33,7 @@ async def test_dynamic_analysis_timeout_returns_partial_coverage() -> None:
     with (
         patch.object(dynamic_analysis_service.settings, "dynamic_analysis_enabled", True),
         patch.object(dynamic_analysis_service.settings, "dynamic_analysis_mode", "remote"),
-        patch.object(dynamic_analysis_service.settings, "dynamic_analysis_remote_url", "https://sandbox.example/analyze"),
+        patch.object(dynamic_analysis_service.settings, "dynamic_analysis_remote_url", "https://sandbox.example"),
         patch.object(dynamic_analysis_service.settings, "dynamic_analysis_timeout_seconds", 5),
         patch.object(dynamic_analysis_service.settings, "dynamic_analysis_fail_open", True),
         patch("app.services.dynamic_analysis_service.httpx.AsyncClient") as mock_client_cls,
@@ -49,8 +47,7 @@ async def test_dynamic_analysis_timeout_returns_partial_coverage() -> None:
             "npm",
             "pkg",
             "1.0.0",
-            Path("C:/tmp/pkg.tgz"),
-        )
+                    )
 
     assert result.metadata["status"] == "partial"
     assert result.metadata["coverage"] == "partial"
@@ -75,7 +72,7 @@ async def test_dynamic_analysis_remote_success_normalizes_payload() -> None:
     with (
         patch.object(dynamic_analysis_service.settings, "dynamic_analysis_enabled", True),
         patch.object(dynamic_analysis_service.settings, "dynamic_analysis_mode", "remote"),
-        patch.object(dynamic_analysis_service.settings, "dynamic_analysis_remote_url", "https://sandbox.example/analyze"),
+        patch.object(dynamic_analysis_service.settings, "dynamic_analysis_remote_url", "https://sandbox.example"),
         patch.object(dynamic_analysis_service.settings, "dynamic_analysis_fail_open", True),
         patch("app.services.dynamic_analysis_service.httpx.AsyncClient") as mock_client_cls,
     ):
@@ -91,8 +88,7 @@ async def test_dynamic_analysis_remote_success_normalizes_payload() -> None:
             "pypi",
             "requests",
             "2.31.0",
-            Path("C:/tmp/requests.whl"),
-        )
+                    )
 
     signal_names = {signal.name for signal in result.signals}
     assert "dynamic_behavior_risk" in signal_names
@@ -119,7 +115,7 @@ async def test_dynamic_analysis_remote_success_uses_cache() -> None:
     with (
         patch.object(dynamic_analysis_service.settings, "dynamic_analysis_enabled", True),
         patch.object(dynamic_analysis_service.settings, "dynamic_analysis_mode", "remote"),
-        patch.object(dynamic_analysis_service.settings, "dynamic_analysis_remote_url", "https://sandbox.example/analyze"),
+        patch.object(dynamic_analysis_service.settings, "dynamic_analysis_remote_url", "https://sandbox.example"),
         patch.object(dynamic_analysis_service.settings, "dynamic_analysis_cache_ttl_seconds", 1800),
         patch("app.services.dynamic_analysis_service.httpx.AsyncClient") as mock_client_cls,
     ):
@@ -135,14 +131,12 @@ async def test_dynamic_analysis_remote_success_uses_cache() -> None:
             "npm",
             "lodash",
             "4.17.21",
-            Path("C:/tmp/lodash.tgz"),
-        )
+                    )
         second = await dynamic_analysis_service.analyze_package_dynamically(
             "npm",
             "lodash",
             "4.17.21",
-            Path("C:/tmp/lodash.tgz"),
-        )
+                    )
 
     assert first is second
     mock_client.post.assert_awaited_once()
@@ -161,9 +155,38 @@ async def test_dynamic_analysis_rejects_insecure_non_local_remote_url() -> None:
             "npm",
             "lodash",
             "4.17.21",
-            Path("C:/tmp/lodash.tgz"),
-        )
+                    )
 
     assert result.metadata["status"] == "skipped"
     assert result.metadata["reason"] == "insecure_remote_url"
     assert result.metadata["sandbox_isolation_enforced"] is True
+
+
+@pytest.mark.asyncio
+async def test_service_not_ready_returns_skipped() -> None:
+    """A 503 from the microservice (engine not initialized) should produce a skipped result."""
+
+    dynamic_analysis_service._dynamic_cache.clear()
+    with (
+        patch.object(dynamic_analysis_service.settings, "dynamic_analysis_enabled", True),
+        patch.object(dynamic_analysis_service.settings, "dynamic_analysis_remote_url", "https://sandbox.example"),
+        patch("app.services.dynamic_analysis_service.httpx.AsyncClient") as mock_client_cls,
+    ):
+        mock_client = AsyncMock()
+        mock_response = MagicMock()
+        mock_response.is_error = True
+        mock_response.status_code = 503
+        mock_client.post = AsyncMock(return_value=mock_response)
+        mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+
+        result = await dynamic_analysis_service.analyze_package_dynamically(
+            "npm",
+            "lodash",
+            "4.17.21",
+        )
+
+    assert result.metadata["status"] == "skipped"
+    assert result.metadata["coverage"] == "none"
+    assert result.metadata["reason"] == "service_not_ready"
+    assert result.metadata["executed_on_api_host"] is False

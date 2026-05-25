@@ -37,41 +37,23 @@ _PYPI_DESC_RE = re.compile(r'package-snippet__description">(.*?)</p>', re.DOTALL
 _PYPI_SIMPLE_ANCHOR_RE = re.compile(r"<a[^>]*>([^<]+)</a>", re.IGNORECASE)
 
 _POPULAR_PYPI_PACKAGES = {
-    "requests",
-    "numpy",
-    "pandas",
-    "scipy",
-    "matplotlib",
-    "pytest",
-    "fastapi",
-    "flask",
-    "django",
-    "httpx",
-    "sqlalchemy",
-    "pydantic",
-    "uvicorn",
-    "beautifulsoup4",
-    "scikit-learn",
-    "tensorflow",
-    "torch",
-    "pillow",
-    "aiohttp",
-    "setuptools",
+    "requests", "numpy", "pandas", "scipy", "matplotlib", "pytest", "fastapi",
+    "flask", "django", "httpx", "sqlalchemy", "pydantic", "uvicorn", "celery",
+    "beautifulsoup4", "scikit-learn", "tensorflow", "torch", "pillow", "aiohttp",
+    "setuptools", "pip", "wheel", "boto3", "redis", "psycopg2", "pymongo",
+    "cryptography", "paramiko", "gunicorn", "alembic", "jinja2", "click",
+    "rich", "typer", "black", "flake8", "mypy", "pytest-asyncio", "anyio",
+    "pyyaml", "toml", "python-dotenv", "starlette", "passlib", "python-jose",
 }
 
 _POPULAR_NPM_PACKAGES = {
-    "react",
-    "react-dom",
-    "next",
-    "express",
-    "lodash",
-    "axios",
-    "typescript",
-    "vite",
-    "webpack",
-    "jest",
-    "eslint",
-    "prettier",
+    "react", "react-dom", "next", "express", "lodash", "axios", "typescript",
+    "vite", "webpack", "jest", "eslint", "prettier", "moment", "underscore",
+    "jquery", "vue", "angular", "svelte", "socket.io", "mongoose", "sequelize",
+    "redux", "mobx", "rxjs", "chalk", "commander", "inquirer", "yargs", "glob",
+    "fs-extra", "debug", "dotenv", "cors", "body-parser", "uuid", "crypto-js",
+    "bcrypt", "jsonwebtoken", "passport", "nodemon", "concurrently", "cross-env",
+    "babel", "rollup", "parcel", "esbuild", "tailwindcss", "styled-components",
 }
 
 _SIMPLE_INDEX_TTL = timedelta(minutes=30)
@@ -199,6 +181,51 @@ def _typosquat_signal(candidate_name: str, query: str) -> dict:
         "normalized_conflict": normalized_conflict,
         "reasons": reasons,
     }
+
+
+def _popular_typosquat_check(ecosystem: str, name: str) -> dict:
+    """Check if a search result name is a typosquat of any well-known popular package.
+
+    This is the right signal for search result display: a result should be flagged
+    when it resembles a popular package but is NOT that package (i.e., a bad actor
+    published a name one edit away from a well-known library).
+
+    Returns the same dict shape as _typosquat_signal.
+    """
+    popular = _POPULAR_NPM_PACKAGES if ecosystem == "npm" else _POPULAR_PYPI_PACKAGES
+    normalized = _normalize_pkg_name(name)
+
+    _empty = {
+        "is_suspected": False,
+        "confidence": 0.0,
+        "levenshtein_distance": None,
+        "edit_distance": None,
+        "normalized_conflict": False,
+        "reasons": [],
+    }
+
+    # Name IS the popular package (exact normalized match) — never suspect it
+    for pkg in popular:
+        if _normalize_pkg_name(pkg) == normalized:
+            return {
+                "is_suspected": False,
+                "confidence": 0.0,
+                "levenshtein_distance": 0,
+                "edit_distance": 0,
+                "normalized_conflict": False,
+                "reasons": [],
+            }
+
+    # Find the closest popular package this name might be mimicking
+    best: dict | None = None
+    best_confidence = 0.0
+    for pkg in popular:
+        signal = _typosquat_signal(name, pkg)
+        if signal.get("is_suspected") and signal.get("confidence", 0.0) > best_confidence:
+            best_confidence = signal["confidence"]
+            best = signal
+
+    return best if best is not None else _empty
 
 
 def _text_from_html_fragment(fragment: str) -> str:
@@ -386,31 +413,56 @@ def suggest_package_name(ecosystem: str, query: str, results: list[dict]) -> str
     if ecosystem not in {"pypi", "npm"}:
         return None
 
-    if ecosystem == "pypi":
-        candidates = {name.lower(): name for name in _POPULAR_PYPI_PACKAGES}
-    else:
-        candidates = {name.lower(): name for name in _POPULAR_NPM_PACKAGES}
+    popular = _POPULAR_NPM_PACKAGES if ecosystem == "npm" else _POPULAR_PYPI_PACKAGES
 
+    # If query exactly matches a popular package (normalized), no suggestion needed.
+    normalized_cleaned = _normalize_pkg_name(cleaned)
+    for pkg in popular:
+        if _normalize_pkg_name(pkg) == normalized_cleaned:
+            return None
+
+    # Direct Levenshtein check on popular packages — catches typos difflib may miss.
+    best_popular: str | None = None
+    best_popular_dist = 3  # only suggest within 2 edits
+    for pkg in popular:
+        dist = _levenshtein_distance(cleaned, pkg.lower())
+        if dist < best_popular_dist:
+            best_popular_dist = dist
+            best_popular = pkg
+
+    # Build candidates from results, excluding packages that are themselves typosquats.
+    result_candidates: dict[str, str] = {}
     for result in results:
         name = result.get("name")
         if not isinstance(name, str) or not name:
             continue
-
-        # Avoid suggesting suspicious typo-squatted names as corrections.
         typosquat = result.get("typosquat")
         if isinstance(typosquat, dict) and typosquat.get("is_suspected") is True:
             continue
+        result_candidates[name.lower()] = name
 
-        candidates[name.lower()] = name
+    if result_candidates:
+        matched = difflib.get_close_matches(cleaned, list(result_candidates.keys()), n=1, cutoff=0.75)
+        if matched:
+            suggestion = result_candidates[matched[0]]
+            if suggestion.lower() == cleaned:
+                return None
+            result_dist = _levenshtein_distance(cleaned, matched[0])
+            # Prefer popular package when it's at least as close as the result candidate.
+            if best_popular and best_popular_dist <= result_dist and best_popular.lower() != cleaned:
+                return best_popular
+            return suggestion
 
-    if not candidates:
-        return None
+    if best_popular and best_popular.lower() != cleaned:
+        return best_popular
 
-    matched = difflib.get_close_matches(cleaned, list(candidates.keys()), n=1, cutoff=0.75)
+    # Fallback: difflib against popular package names only.
+    pop_candidates = {p.lower(): p for p in popular}
+    matched = difflib.get_close_matches(cleaned, list(pop_candidates.keys()), n=1, cutoff=0.75)
     if not matched:
         return None
 
-    suggestion = candidates[matched[0]]
+    suggestion = pop_candidates[matched[0]]
     if suggestion.lower() == cleaned:
         return None
     return suggestion
@@ -445,7 +497,8 @@ async def _build_pypi_exact_result(
         "registry_url": f"https://pypi.org/project/{name}/",
         "score": None,
         "monthly_downloads": None,
-        "typosquat": _typosquat_signal(name, query),
+        "typosquat": _popular_typosquat_check("pypi", name),
+        "query_distance": _levenshtein_distance(name.lower(), query.strip().lower()),
     }
 
 
@@ -548,7 +601,8 @@ async def _search_librariesio_pypi_packages(
                 "registry_url": f"https://pypi.org/project/{name}/",
                 "score": item.get("rank"),
                 "monthly_downloads": None,
-                "typosquat": _typosquat_signal(name, query),
+                "typosquat": _popular_typosquat_check("pypi", name),
+                "query_distance": _levenshtein_distance(name.lower(), query.strip().lower()),
             }
         )
 
@@ -636,7 +690,8 @@ async def search_npm_packages(
                     "registry_url": links.get("npm") or f"https://www.npmjs.com/package/{name}",
                     "score": score_obj.get("final"),
                     "monthly_downloads": None,
-                    "typosquat": _typosquat_signal(name, query),
+                    "typosquat": _popular_typosquat_check("npm", name),
+                    "query_distance": _levenshtein_distance(name.lower(), query.strip().lower()),
                 }
             )
 
@@ -704,7 +759,8 @@ async def search_pypi_packages(
                         "registry_url": project_url,
                         "score": None,
                         "monthly_downloads": None,
-                        "typosquat": _typosquat_signal(name, query),
+                        "typosquat": _popular_typosquat_check("pypi", name),
+                        "query_distance": _levenshtein_distance(name.lower(), query.strip().lower()),
                     }
                 )
 
@@ -738,7 +794,8 @@ async def search_pypi_packages(
                             "registry_url": f"https://pypi.org/project/{name}/",
                             "score": None,
                             "monthly_downloads": None,
-                            "typosquat": _typosquat_signal(name, query),
+                            "typosquat": _popular_typosquat_check("pypi", name),
+                            "query_distance": _levenshtein_distance(name.lower(), query.strip().lower()),
                         }
                     )
 

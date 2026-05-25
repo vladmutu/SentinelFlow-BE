@@ -9,10 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import shutil
-import tempfile
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from uuid import UUID
 
 import httpx
@@ -25,7 +22,6 @@ from app.models.scan import ScanJob, ScanResult, ScanTask
 from app.services import (
     dynamic_analysis_service,
     manifest_utils,
-    package_fetcher,
     reputation_service,
     scanner_service,
     vulnerability_service,
@@ -41,7 +37,7 @@ _TASK_DONE = "done"
 _TASK_FAILED = "failed"
 _TASK_TERMINAL_STATES = {_TASK_DONE, _TASK_FAILED}
 
-_scan_task_queue: asyncio.Queue[UUID] | None = None
+_scan_task_queue: asyncio.Queue[tuple[UUID, str]] | None = None
 _scan_worker_tasks: list[asyncio.Task] = []
 _scan_worker_lock = asyncio.Lock()
 
@@ -53,11 +49,12 @@ async def run_scan_job(
     ecosystem: str,
     access_token: str,
     selected_packages: list[str] | None = None,
+    scan_mode: str = "full",
 ) -> None:
     """Create DB-backed package tasks and enqueue them for worker execution."""
     async with AsyncSessionLocal() as db:
         try:
-            await _set_job_status(db, job_id, "running", started_at=datetime.now(timezone.utc))
+            await _set_job_status(db, job_id, "running", started_at=datetime.now(timezone.utc), scan_mode=scan_mode)
 
             headers = {
                 "Accept": "application/vnd.github+json",
@@ -109,6 +106,7 @@ async def run_scan_job(
                 total_unique_packages=total_unique_packages,
             )
 
+            # Create ScanTask records first so we have task.id UUIDs to pass to the coordinator.
             tasks = [
                 ScanTask(
                     job_id=job_id,
@@ -125,7 +123,7 @@ async def run_scan_job(
             await db.commit()
 
             for task in tasks:
-                await enqueue_scan_task(task.id)
+                await enqueue_scan_task(task.id, scan_mode)
 
         except Exception as exc:
             logger.exception("Scan job %s failed during orchestration", job_id)
@@ -185,29 +183,28 @@ def _filter_selected_packages(
     return filtered
 
 
-async def enqueue_scan_task(task_id: UUID) -> None:
+async def enqueue_scan_task(task_id: UUID, scan_mode: str = "full") -> None:
     """Enqueue a single package task for asynchronous worker processing."""
     await _ensure_scan_workers_started()
     assert _scan_task_queue is not None
-    await _scan_task_queue.put(task_id)
+    await _scan_task_queue.put((task_id, scan_mode))
 
 
 async def _ensure_scan_workers_started() -> None:
     global _scan_task_queue
 
-    if _scan_task_queue is not None and _scan_worker_tasks:
-        return
-
     async with _scan_worker_lock:
         if _scan_task_queue is None:
             _scan_task_queue = asyncio.Queue()
 
-        if _scan_worker_tasks:
-            return
+        # Remove dead (cancelled / errored) workers so new ones can be spawned.
+        alive = [t for t in _scan_worker_tasks if not t.done()]
+        _scan_worker_tasks.clear()
+        _scan_worker_tasks.extend(alive)
 
-        worker_count = max(1, settings.scanner_concurrency)
-        for worker_index in range(worker_count):
-            worker = asyncio.create_task(_scan_task_worker(worker_index))
+        needed = max(1, settings.scanner_concurrency) - len(_scan_worker_tasks)
+        for _ in range(needed):
+            worker = asyncio.create_task(_scan_task_worker(len(_scan_worker_tasks)))
             _scan_worker_tasks.append(worker)
 
 
@@ -215,17 +212,30 @@ async def _scan_task_worker(worker_index: int) -> None:
     assert _scan_task_queue is not None
 
     while True:
-        task_id = await _scan_task_queue.get()
+        # Separate the get() from the processing so we never call task_done()
+        # for an item we never actually received (e.g. CancelledError during get).
         try:
-            await _scan_single_package(task_id)
+            task_id, scan_mode = await _scan_task_queue.get()
+        except asyncio.CancelledError:
+            raise  # Worker is being shut down — do not call task_done()
+
+        try:
+            await _scan_single_package(task_id, scan_mode)
         except Exception as exc:
             logger.exception("Worker %s crashed processing task %s: %s", worker_index, task_id, exc)
         finally:
             _scan_task_queue.task_done()
 
 
-async def _scan_single_package(task_id: UUID) -> None:
-    """Execute one package task by id with explicit status transitions."""
+async def _scan_single_package(task_id: UUID, scan_mode: str = "full") -> None:
+    """Execute one package task by id with explicit status transitions.
+
+    scan_mode controls which analysis phases run:
+      full            — static + vulnerability (OSV/NVD) + dynamic (if malicious) + reputation
+      static_only     — static analysis only
+      static_dynamic  — static + dynamic (if malicious); no vulnerability / reputation
+      dynamic_only    — unconditional dynamic analysis; no static / vulnerability / reputation
+    """
     task = await _load_task(task_id)
     if task is None:
         logger.warning("Task %s not found", task_id)
@@ -246,87 +256,116 @@ async def _scan_single_package(task_id: UUID) -> None:
     if await _try_reuse_recent_scan_result(task_id, task):
         return
 
-    tmp_dir = Path(tempfile.mkdtemp(prefix="sentinel_pkg_"))
+    # Phase flags derived from scan_mode
+    # full        → static → CVE+libraries.io (if risky) → dynamic (if still risky)
+    # static_only → static → CVE+libraries.io (if risky); no dynamic
+    # lightweight → CVE for all packages; libraries.io only for direct deps or CVE-positive packages
+    # dynamic_only → dynamic only; no static, no CVE, no libraries.io
+    STATIC_RISK_ENRICHMENT_THRESHOLD = 0.5
+
+    run_static    = scan_mode in {"full", "static_only"}
+    force_dynamic = scan_mode == "dynamic_only"
+    run_lightweight = scan_mode == "lightweight"
+
     try:
-        await _set_task_status(task_id, _TASK_DOWNLOADING)
-
-        try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0)) as client:
-                if task.ecosystem == "npm":
-                    artifact_path = await package_fetcher.fetch_npm_package(
-                        task.package_name,
-                        task.package_version,
-                        tmp_dir,
-                        client=client,
-                    )
-                else:
-                    artifact_path = await package_fetcher.fetch_pypi_package(
-                        task.package_name,
-                        task.package_version,
-                        tmp_dir,
-                        client=client,
-                    )
-        except Exception as exc:
-            await _set_task_failed(task_id, f"Download failed: {exc}")
-            return
-
         await _set_task_status(task_id, _TASK_ANALYZING)
-        try:
+
+        # ── Step 1: Static analysis ──────────────────────────────────────────
+        if run_static:
             verdict = await scanner_service.analyze_package_static(
-                task.ecosystem,
+                str(task.id),
                 task.package_name,
                 task.package_version,
-                artifact_path,
+                task.ecosystem,
             )
-        except Exception as exc:
-            await _set_task_failed(task_id, f"Static analysis failed: {exc}")
-            return
+        else:
+            verdict = scanner_service.ScanVerdict(malware_status="unknown", malware_score=None)
 
         await _set_task_status(task_id, _TASK_CLASSIFYING)
         dependency_context = getattr(task, "dependency_context", None)
-        vulnerability_result = await vulnerability_service.lookup_package_vulnerabilities(
-            task.ecosystem,
-            task.package_name,
-            task.package_version,
-        )
+        dep_ctx = dependency_context if isinstance(dependency_context, dict) else {}
+        is_direct_dep = bool(dep_ctx.get("is_direct_dependency", False))
 
-        preliminary_priority = _estimate_dynamic_priority_score(verdict, vulnerability_result)
-        if _should_run_dynamic_analysis(preliminary_priority, verdict, vulnerability_result):
+        # ── Step 2: Determine enrichment need ───────────────────────────────
+        # For lightweight: always enrich all packages with CVE + libraries.io.
+        # For full/static_only: only enrich if static analysis flags the package as risky.
+        static_is_risky = (
+            verdict.malware_status == "malicious"
+            or (verdict.malware_score is not None and verdict.malware_score > STATIC_RISK_ENRICHMENT_THRESHOLD)
+        )
+        should_enrich = run_lightweight or (run_static and static_is_risky)
+
+        # ── Step 3: CVE lookup (OSV/NVD) ─────────────────────────────────────
+        if should_enrich:
+            vulnerability_result = await vulnerability_service.lookup_package_vulnerabilities(
+                task.ecosystem,
+                task.package_name,
+                task.package_version,
+            )
+        else:
+            vulnerability_result = vulnerability_service.VulnerabilityLookupResult(
+                signals=[], advisory_references=[], evidence=[], metadata={"skipped": True}
+            )
+
+        # ── Step 4: Libraries.io / reputation ────────────────────────────────
+        # For lightweight mode: Libraries.io is only called when CVEs were found or the
+        # package is a direct dependency. This keeps well within the 60 req/min limit
+        # since most packages in a healthy project have no CVEs.
+        if should_enrich:
+            has_cves = len(vulnerability_result.signals) > 0
+            try:
+                reputation_result = await reputation_service.lookup_package_reputation(
+                    task.ecosystem,
+                    task.package_name,
+                    task.package_version,
+                    is_direct_dependency=is_direct_dep,
+                    force_librariesio=is_direct_dep or has_cves,
+                )
+            except Exception:
+                logger.warning(
+                    "Reputation lookup failed for %s@%s, proceeding without",
+                    task.package_name,
+                    task.package_version,
+                )
+                reputation_result = reputation_service.ReputationLookupResult(
+                    signals=[], evidence=[], metadata={"error": "lookup_failed"}
+                )
+        else:
+            reputation_result = reputation_service.ReputationLookupResult(
+                signals=[], evidence=[], metadata={"skipped": True}
+            )
+
+        # ── Step 5: Dynamic analysis (full mode only, if still risky) ────────
+        run_dynamic = force_dynamic or (
+            scan_mode == "full" and _should_run_dynamic_analysis(verdict, reputation_result)
+        )
+        if run_dynamic:
             dynamic_result = await dynamic_analysis_service.analyze_package_dynamically(
                 task.ecosystem,
                 task.package_name,
                 task.package_version,
-                artifact_path,
             )
         else:
+            skip_reason = (
+                "mode_excluded" if scan_mode in {"static_only", "lightweight"}
+                else "not_malicious"
+            )
             dynamic_result = dynamic_analysis_service.build_skipped_dynamic_result(
-                "priority_filtered",
-                detail=f"preliminary_score={preliminary_priority:.6f}",
+                skip_reason,
+                detail=f"scan_mode={scan_mode}, static_verdict={verdict.malware_status}",
             )
 
-        # Reputation lookup
-        try:
-            reputation_result = await reputation_service.lookup_package_reputation(
-                task.ecosystem,
-                task.package_name,
-                task.package_version,
-            )
-        except Exception:
-            logger.warning(
-                "Reputation lookup failed for %s@%s, proceeding without",
-                task.package_name,
-                task.package_version,
-            )
-            reputation_result = reputation_service.ReputationLookupResult(
-                signals=[], evidence=[], metadata={"error": "lookup_failed"}
-            )
+        # For dynamic_only: derive verdict from dynamic findings (no static verdict available)
+        if force_dynamic and not run_static:
+            verdict = _derive_verdict_from_dynamic(dynamic_result)
 
-        if verdict.malware_status == "error":
+        if run_static and verdict.malware_status == "error":
             risk_assessment = scanner_service.build_package_risk_assessment(
                 task.package_name,
                 task.package_version,
                 task.ecosystem,
                 verdict,
+                scan_mode=scan_mode,
                 dependency_context=dependency_context,
                 dynamic_signals=dynamic_result.signals,
                 dynamic_evidence=dynamic_result.evidence,
@@ -351,6 +390,7 @@ async def _scan_single_package(task_id: UUID) -> None:
             task.package_version,
             task.ecosystem,
             verdict,
+            scan_mode=scan_mode,
             dependency_context=dependency_context,
             dynamic_signals=dynamic_result.signals,
             dynamic_evidence=dynamic_result.evidence,
@@ -368,55 +408,60 @@ async def _scan_single_package(task_id: UUID) -> None:
     except Exception as exc:
         logger.exception("Task %s failed", task_id)
         await _set_task_failed(task_id, str(exc))
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-def _max_vulnerability_risk(vulnerability_result: object) -> float:
-    signals = getattr(vulnerability_result, "signals", None)
-    if not isinstance(signals, list):
-        return 0.0
+def _derive_verdict_from_dynamic(
+    dynamic_result: dynamic_analysis_service.DynamicAnalysisResult,
+) -> scanner_service.ScanVerdict:
+    """Map dynamic analysis signals to a ScanVerdict for dynamic_only scans."""
+    metadata = dynamic_result.metadata
+    status = str(metadata.get("status", "unknown"))
 
-    max_score = 0.0
-    for signal in signals:
-        signal_name = getattr(signal, "name", None)
-        value = getattr(signal, "value", None)
-        if signal_name != "vulnerability_detected":
-            continue
-        if isinstance(value, bool):
-            continue
-        if isinstance(value, (int, float)):
-            max_score = max(max_score, max(0.0, min(float(value) / 10.0, 1.0)))
-    return max_score
+    if status in {"skipped", "partial"}:
+        return scanner_service.ScanVerdict(malware_status="unknown", malware_score=None)
 
+    behavior_score: float | None = None
+    ioc_hit = False
+    for signal in dynamic_result.signals:
+        if signal.name == "dynamic_ioc_hit":
+            ioc_hit = True
+        elif signal.name == "dynamic_behavior_risk":
+            try:
+                behavior_score = float(signal.value)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                pass
 
-def _estimate_dynamic_priority_score(
-    verdict: scanner_service.ScanVerdict,
-    vulnerability_result: object,
-) -> float:
-    classifier_score = verdict.malware_score if isinstance(verdict.malware_score, (int, float)) else 0.0
-    vulnerability_score = _max_vulnerability_risk(vulnerability_result)
-    return max(classifier_score, vulnerability_score)
+    if ioc_hit or (behavior_score is not None and behavior_score > settings.risk_scoring_suspicious_max):
+        return scanner_service.ScanVerdict(
+            malware_status="malicious",
+            malware_score=behavior_score if behavior_score is not None else 1.0,
+        )
+
+    if behavior_score is not None:
+        return scanner_service.ScanVerdict(malware_status="clean", malware_score=behavior_score)
+
+    return scanner_service.ScanVerdict(malware_status="unknown", malware_score=None)
 
 
 def _should_run_dynamic_analysis(
-    preliminary_score: float,
     verdict: scanner_service.ScanVerdict,
-    vulnerability_result: object,
+    reputation_result: reputation_service.ReputationLookupResult | None = None,
 ) -> bool:
     if not settings.dynamic_analysis_enabled:
-        return True
+        return False
+    if verdict.malware_status != "malicious":
+        return False
+    # If libraries.io says the package is highly trusted, skip dynamic analysis —
+    # a high static score for a well-known package is likely a false positive.
+    if reputation_result is not None:
+        trust = reputation_result.metadata.get("trust_score", 0.0)
+        if isinstance(trust, float) and trust >= 0.8:
+            logger.info(
+                "Skipping dynamic analysis for high-trust package (trust_score=%.2f)", trust
+            )
+            return False
+    return True
 
-    if verdict.malware_status == "malicious":
-        return True
-
-    if (
-        settings.dynamic_analysis_force_on_vulnerability
-        and getattr(vulnerability_result, "signals", None)
-    ):
-        return True
-
-    return preliminary_score >= max(0.0, settings.dynamic_analysis_priority_threshold)
 
 
 def _augment_cached_risk_assessment(risk_assessment: object | None, *, source_result_id: UUID) -> object | None:
@@ -562,7 +607,7 @@ async def _set_task_status(task_id: UUID, status: str) -> None:
         now = datetime.now(timezone.utc)
         task.status = status
         task.updated_at = now
-        if status == _TASK_DOWNLOADING and task.started_at is None:
+        if status in {_TASK_DOWNLOADING, _TASK_ANALYZING} and task.started_at is None:
             task.started_at = now
         await db.commit()
 
@@ -626,6 +671,32 @@ async def _set_task_failed(
         await db.commit()
 
 
+def _derive_malware_status(task: ScanTask, risk_assessment: object | None) -> str:
+    """Derive the effective malware_status for a scan result.
+
+    When no classifier ran (lightweight / dynamic_only mode) the task verdict is
+    "unknown". In that case we promote the status to the risk assessment's
+    overall_status so that the column reflects actual CVE/reputation findings
+    rather than always being "unknown".
+    "suspicious" maps to "malicious" because the column only stores four values.
+    """
+    base = task.malware_status or "unknown"
+    if base != "unknown":
+        return base
+    if risk_assessment is None:
+        return base
+    ra_status: object = (
+        risk_assessment.overall_status  # type: ignore[union-attr]
+        if hasattr(risk_assessment, "overall_status")
+        else (risk_assessment.get("overall_status") if isinstance(risk_assessment, dict) else None)
+    )
+    if ra_status == "clean":
+        return "clean"
+    if ra_status in {"malicious", "suspicious"}:
+        return "malicious"
+    return base
+
+
 async def _upsert_result_from_task(
     db: AsyncSession,
     task: ScanTask,
@@ -634,6 +705,7 @@ async def _upsert_result_from_task(
     risk_assessment: object | None = None,
 ) -> None:
     risk_fields = _extract_result_risk_fields(risk_assessment)
+    effective_status = _derive_malware_status(task, risk_assessment)
     stmt = select(ScanResult).where(
         ScanResult.job_id == task.job_id,
         ScanResult.package_name == task.package_name,
@@ -649,7 +721,7 @@ async def _upsert_result_from_task(
                 package_name=task.package_name,
                 package_version=task.package_version,
                 ecosystem=task.ecosystem,
-                malware_status=task.malware_status or "unknown",
+                malware_status=effective_status,
                 malware_score=task.malware_score,
                 risk_assessment=_serialize_risk_assessment(risk_assessment),
                 risk_breakdown=risk_fields["risk_breakdown"],
@@ -665,7 +737,7 @@ async def _upsert_result_from_task(
         )
         return
 
-    existing.malware_status = task.malware_status or "unknown"
+    existing.malware_status = effective_status
     existing.malware_score = task.malware_score
     existing.risk_assessment = _serialize_risk_assessment(risk_assessment)
     existing.risk_breakdown = risk_fields["risk_breakdown"]
@@ -719,6 +791,7 @@ async def _set_job_status(
     started_at: datetime | None = None,
     completed_at: datetime | None = None,
     error_message: str | None = None,
+    scan_mode: str | None = None,
 ) -> None:
     stmt = select(ScanJob).where(ScanJob.id == job_id)
     row = (await db.execute(stmt)).scalar_one()
@@ -729,6 +802,8 @@ async def _set_job_status(
         row.completed_at = completed_at
     if error_message is not None:
         row.error_message = error_message
+    if scan_mode is not None:
+        row.scan_mode = scan_mode
     await db.commit()
 
 

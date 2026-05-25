@@ -44,15 +44,17 @@ class Settings(BaseSettings):
         default="http://localhost:8090",
         alias="STATIC_ANALYSIS_REMOTE_URL",
     )
-    scanner_model_path: str = Field(default="malware_classifier.pkl", alias="SCANNER_MODEL_PATH")
-    scanner_threshold_path: str = Field(default="malware_threshold.pkl", alias="SCANNER_THRESHOLD_PATH")
+    static_analysis_timeout_seconds: int = Field(
+        default=120,
+        alias="STATIC_ANALYSIS_TIMEOUT_SECONDS",
+    )
     scanner_artifact_max_files: int = Field(default=50000, alias="SCANNER_ARTIFACT_MAX_FILES")
     scanner_artifact_max_total_bytes: int = Field(default=500000000, alias="SCANNER_ARTIFACT_MAX_TOTAL_BYTES")
     scanner_artifact_extract_timeout_seconds: int = Field(
         default=30,
         alias="SCANNER_ARTIFACT_EXTRACT_TIMEOUT_SECONDS",
     )
-    scan_result_reuse_enabled: bool = Field(default=True, alias="SCAN_RESULT_REUSE_ENABLED")
+    scan_result_reuse_enabled: bool = Field(default=False, alias="SCAN_RESULT_REUSE_ENABLED")
     scan_result_reuse_ttl_seconds: int = Field(default=3600, alias="SCAN_RESULT_REUSE_TTL_SECONDS")
 
     # Dependency PR workflow settings
@@ -170,7 +172,7 @@ class Settings(BaseSettings):
         alias="DYNAMIC_ANALYSIS_MODE",
     )
     dynamic_analysis_remote_url: str = Field(
-        default="http://localhost:8080",
+        default="http://localhost:8091",
         alias="DYNAMIC_ANALYSIS_REMOTE_URL",
     )
     dynamic_analysis_api_key: str = Field(
@@ -178,7 +180,7 @@ class Settings(BaseSettings):
         alias="DYNAMIC_ANALYSIS_API_KEY",
     )
     dynamic_analysis_timeout_seconds: int = Field(
-        default=15,
+        default=200,
         alias="DYNAMIC_ANALYSIS_TIMEOUT_SECONDS",
     )
     dynamic_analysis_fail_open: bool = Field(

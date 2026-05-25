@@ -187,6 +187,80 @@ def _find_similar_popular_package(ecosystem: str, name: str) -> str | None:
     return None
 
 
+async def _validate_one(
+    client: httpx.AsyncClient,
+    ecosystem: str,
+    dep: DependencySpec,
+) -> TyposquatValidation:
+    """Validate a single dependency spec for typosquatting risk."""
+    similar_popular = _find_similar_popular_package(ecosystem, dep.name)
+
+    if ecosystem == "npm":
+        exists, downloads, age_days = await _check_npm_exists(client, dep.name)
+    else:
+        exists, downloads, age_days = await _check_pypi_exists(client, dep.name)
+
+    typosquat_analysis: dict = {}
+    if similar_popular:
+        typosquat_analysis = _typosquat_signal(dep.name, similar_popular)
+
+    reasons: list[str] = []
+    risk_level = "safe"
+
+    if not exists:
+        risk_level = "blocked"
+        if similar_popular:
+            reasons.append(
+                f"Package '{dep.name}' does not exist on {ecosystem} registry. "
+                f"Did you mean '{similar_popular}'?"
+            )
+        else:
+            reasons.append(f"Package '{dep.name}' does not exist on {ecosystem} registry")
+
+    elif similar_popular:
+        confidence = typosquat_analysis.get("confidence", 0.0)
+        is_very_new = age_days is not None and age_days < 7
+        is_low_downloads = downloads is not None and downloads < 100
+
+        if confidence >= settings.typosquat_block_threshold:
+            risk_level = "blocked"
+            reasons.append(
+                f"Package name is suspiciously similar to popular package '{similar_popular}' "
+                f"(confidence: {confidence:.0%})"
+            )
+        elif confidence >= 0.5:
+            if is_very_new and is_low_downloads:
+                risk_level = "blocked"
+                reasons.append(
+                    f"New package (created {age_days} days ago) with very low downloads "
+                    f"and similar to '{similar_popular}'"
+                )
+            else:
+                risk_level = "warning"
+                reasons.append(
+                    f"Package name is somewhat similar to popular package '{similar_popular}' "
+                    f"(confidence: {confidence:.0%})"
+                )
+        elif is_very_new and is_low_downloads:
+            risk_level = "warning"
+            reasons.append(
+                f"Very new package ({age_days} days old) with low downloads, "
+                f"name somewhat resembles '{similar_popular}'"
+            )
+
+    return TyposquatValidation(
+        package_name=dep.name,
+        package_version=dep.version,
+        risk_level=risk_level,
+        exists_on_registry=exists,
+        typosquat_analysis=typosquat_analysis,
+        monthly_downloads=downloads,
+        package_age_days=age_days,
+        similar_popular_package=similar_popular,
+        reasons=reasons,
+    )
+
+
 async def validate_packages(
     ecosystem: str,
     dependencies: list[DependencySpec],
@@ -194,6 +268,7 @@ async def validate_packages(
     """Validate a list of dependency specs for typosquatting risk.
 
     Returns one TyposquatValidation result per dependency.
+    Checks run concurrently for speed.
     """
     if not settings.typosquat_check_enabled:
         return [
@@ -211,75 +286,11 @@ async def validate_packages(
             for dep in dependencies
         ]
 
-    results: list[TyposquatValidation] = []
     timeout = httpx.Timeout(15.0, connect=5.0)
-
     async with httpx.AsyncClient(timeout=timeout) as client:
-        for dep in dependencies:
-            similar_popular = _find_similar_popular_package(ecosystem, dep.name)
+        results = await asyncio.gather(
+            *[_validate_one(client, ecosystem, dep) for dep in dependencies],
+            return_exceptions=False,
+        )
 
-            # Check if package exists
-            if ecosystem == "npm":
-                exists, downloads, age_days = await _check_npm_exists(client, dep.name)
-            else:
-                exists, downloads, age_days = await _check_pypi_exists(client, dep.name)
-
-            # Run typosquat analysis against the similar package (if any)
-            typosquat_analysis = {}
-            if similar_popular:
-                typosquat_analysis = _typosquat_signal(dep.name, similar_popular)
-
-            # Determine risk level
-            reasons: list[str] = []
-            risk_level = "safe"
-
-            if not exists:
-                risk_level = "blocked"
-                reasons.append(f"Package '{dep.name}' does not exist on {ecosystem} registry")
-
-            elif similar_popular:
-                confidence = typosquat_analysis.get("confidence", 0.0)
-
-                # Check if it's a very new package close to a popular name
-                is_very_new = age_days is not None and age_days < 7
-                is_low_downloads = downloads is not None and downloads < 100
-
-                if confidence >= settings.typosquat_block_threshold:
-                    risk_level = "blocked"
-                    reasons.append(
-                        f"Package name is suspiciously similar to popular package '{similar_popular}' "
-                        f"(confidence: {confidence:.0%})"
-                    )
-                elif confidence >= 0.5:
-                    if is_very_new and is_low_downloads:
-                        risk_level = "blocked"
-                        reasons.append(
-                            f"New package (created {age_days} days ago) with very low downloads "
-                            f"and similar to '{similar_popular}'"
-                        )
-                    else:
-                        risk_level = "warning"
-                        reasons.append(
-                            f"Package name is somewhat similar to popular package '{similar_popular}' "
-                            f"(confidence: {confidence:.0%})"
-                        )
-                elif is_very_new and is_low_downloads:
-                    risk_level = "warning"
-                    reasons.append(
-                        f"Very new package ({age_days} days old) with low downloads, "
-                        f"name somewhat resembles '{similar_popular}'"
-                    )
-
-            results.append(TyposquatValidation(
-                package_name=dep.name,
-                package_version=dep.version,
-                risk_level=risk_level,
-                exists_on_registry=exists,
-                typosquat_analysis=typosquat_analysis,
-                monthly_downloads=downloads,
-                package_age_days=age_days,
-                similar_popular_package=similar_popular,
-                reasons=reasons,
-            ))
-
-    return results
+    return list(results)

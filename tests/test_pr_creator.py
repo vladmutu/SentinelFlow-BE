@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import base64
 import subprocess
-from unittest.mock import AsyncMock, MagicMock
+import uuid
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
+from httpx import ASGITransport, AsyncClient
 
 from app.api.schemas.dependency import DependencySpec
 from app.services import pr_creator
@@ -335,3 +337,159 @@ async def test_generate_lockfile_server_side_uses_subprocess_run(monkeypatch):
     )
 
     assert '{"lockfileVersion":3}' in result
+
+
+# ── Endpoint integration tests ─────────────────────────────────────────
+
+
+@pytest.fixture
+def mock_pr_user():
+    user = MagicMock()
+    user.id = uuid.uuid4()
+    user.access_token = "ghp_test_token"
+    user.username = "testuser"
+    return user
+
+
+@pytest.fixture
+def mock_pr_db():
+    db = AsyncMock()
+    db.commit = AsyncMock()
+    db.add = MagicMock()
+    return db
+
+
+@pytest.fixture
+def pr_endpoint_app(mock_pr_user, mock_pr_db):
+    from app.main import create_app
+    from app.api.deps import get_current_user, get_db
+
+    _app = create_app()
+    _app.dependency_overrides[get_current_user] = lambda: mock_pr_user
+
+    async def _override_db():
+        yield mock_pr_db
+
+    _app.dependency_overrides[get_db] = _override_db
+    yield _app
+    _app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+async def test_add_dependency_triggers_scan(pr_endpoint_app, mock_pr_db):
+    """After PR creation, a ScanJob with scan_mode='static_dynamic' is created and submitted."""
+    from app.models.scan import ScanJob
+
+    captured = {}
+
+    def _capture_add(obj):
+        if isinstance(obj, ScanJob):
+            captured["scan_job"] = obj
+
+    mock_pr_db.add = MagicMock(side_effect=_capture_add)
+
+    async def _fake_refresh(obj):
+        if isinstance(obj, ScanJob) and (not hasattr(obj, "id") or obj.id is None):
+            obj.id = uuid.uuid4()
+
+    mock_pr_db.refresh = AsyncMock(side_effect=_fake_refresh)
+
+    dummy_pr = PullRequestResult(
+        pr_url="https://github.com/owner/repo/pull/1",
+        pr_number=1,
+        branch_name="sentinelflow/deps/lodash",
+    )
+
+    with (
+        patch(
+            "app.services.typosquat_guard.validate_packages",
+            new_callable=AsyncMock,
+            return_value=[],
+        ),
+        patch(
+            "app.api.endpoints.repos._get_installation_token_for_repo",
+            side_effect=HTTPException(status_code=404),
+        ),
+        patch(
+            "app.services.pr_creator.create_npm_dependency_pr",
+            new_callable=AsyncMock,
+            return_value=dummy_pr,
+        ),
+        patch("app.api.endpoints.repos.job_runner") as mock_runner,
+    ):
+        def _submit_and_close(coro):
+            coro.close()
+            return MagicMock()
+
+        mock_runner.submit = MagicMock(side_effect=_submit_and_close)
+
+        async with AsyncClient(
+            transport=ASGITransport(app=pr_endpoint_app), base_url="http://test"
+        ) as client:
+            resp = await client.post(
+                "/api/repos/owner/repo/dependencies/add",
+                json={
+                    "ecosystem": "npm",
+                    "dependencies": [{"name": "lodash", "version": "^4.17.21"}],
+                },
+            )
+
+    assert resp.status_code == 202
+    body = resp.json()
+
+    scan_job = captured.get("scan_job")
+    assert scan_job is not None, "ScanJob was not created"
+    assert scan_job.scan_mode == "static_dynamic"
+    assert scan_job.owner == "owner"
+    assert scan_job.repo_name == "repo"
+
+    mock_runner.submit.assert_called_once()
+    assert body.get("scan_job_id") is not None
+
+
+@pytest.mark.asyncio
+async def test_add_dependency_scan_failure_does_not_block_pr(pr_endpoint_app, mock_pr_db):
+    """PR creation returns 202 even when scan job DB commit raises."""
+    mock_pr_db.commit = AsyncMock(side_effect=Exception("DB connection lost"))
+
+    dummy_pr = PullRequestResult(
+        pr_url="https://github.com/owner/repo/pull/2",
+        pr_number=2,
+        branch_name="sentinelflow/deps/lodash-v2",
+    )
+
+    with (
+        patch(
+            "app.services.typosquat_guard.validate_packages",
+            new_callable=AsyncMock,
+            return_value=[],
+        ),
+        patch(
+            "app.api.endpoints.repos._get_installation_token_for_repo",
+            side_effect=HTTPException(status_code=404),
+        ),
+        patch(
+            "app.services.pr_creator.create_npm_dependency_pr",
+            new_callable=AsyncMock,
+            return_value=dummy_pr,
+        ),
+        patch("app.api.endpoints.repos.job_runner") as mock_runner,
+    ):
+        mock_runner.submit = MagicMock()
+
+        async with AsyncClient(
+            transport=ASGITransport(app=pr_endpoint_app), base_url="http://test"
+        ) as client:
+            resp = await client.post(
+                "/api/repos/owner/repo/dependencies/add",
+                json={
+                    "ecosystem": "npm",
+                    "dependencies": [{"name": "lodash", "version": "^4.17.21"}],
+                },
+            )
+
+    assert resp.status_code == 202
+    body = resp.json()
+    assert body.get("pr_number") == 2
+    assert body.get("scan_job_id") is None
+    mock_runner.submit.assert_not_called()

@@ -13,14 +13,17 @@ import logging
 from typing import Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.api.deps import get_current_user
 from app.api.schemas.scan import (
+    ScanHistoryResponse,
+    ScanHistorySummary,
     ScanJobResponse,
+    ScanJobResultsResponse,
     ScanResultMapEntry,
     ScanResultResponse,
     ScanTriggerRequest,
@@ -59,6 +62,61 @@ def _to_string_list(value: object) -> list[str]:
     return [str(item) for item in value if isinstance(item, str)]
 
 
+def _job_scan_mode(job: ScanJob) -> str:
+    sm = getattr(job, "scan_mode", None)
+    return sm if isinstance(sm, str) and sm else "full"
+
+
+def _extract_scan_detail_fields(risk_assessment: dict[str, object] | None) -> dict[str, object]:
+    """Extract static feature snapshot and dynamic analysis findings for frontend detail views."""
+    if not isinstance(risk_assessment, dict):
+        return {"static_features": None, "dynamic_findings": None}
+    metadata = risk_assessment.get("metadata") or {}
+    return {
+        "static_features": metadata.get("feature_snapshot"),
+        "dynamic_findings": metadata.get("dynamic"),
+    }
+
+
+def _extract_reputation_metadata(risk_assessment: dict[str, object] | None) -> dict[str, object] | None:
+    """Surface reputation metadata (downloads, stars, source_rank, etc.) from the risk assessment blob."""
+    if not isinstance(risk_assessment, dict):
+        return None
+    metadata = risk_assessment.get("metadata") or {}
+    rep = metadata.get("reputation") if isinstance(metadata, dict) else None
+    if not isinstance(rep, dict):
+        return None
+    keys = (
+        "monthly_downloads", "package_age_days", "has_repository",
+        "maintainer_count", "libraries_io_rank", "dependents_count",
+        "stars", "trust_score",
+    )
+    result = {k: rep[k] for k in keys if k in rep}
+    return result or None
+
+
+def _extract_vulnerability_details(risk_assessment: dict[str, object] | None) -> list[dict[str, object]]:
+    """Surface per-advisory details (CVE ID, source, CVSS score, description) from vulnerability signals."""
+    if not isinstance(risk_assessment, dict):
+        return []
+    details: list[dict[str, object]] = []
+    for signal in risk_assessment.get("vulnerability_signals") or []:
+        if not isinstance(signal, dict):
+            continue
+        meta = signal.get("metadata") or {}
+        advisory_id = meta.get("advisory_id") if isinstance(meta, dict) else None
+        if not advisory_id:
+            continue
+        details.append({
+            "id": advisory_id,
+            "source": signal.get("source", "unknown"),
+            "cvss_score": signal.get("value"),
+            "description": meta.get("details") or meta.get("description"),
+            "aliases": meta.get("aliases") or [],
+        })
+    return details
+
+
 def _extract_risk_breakdown(risk_assessment: dict[str, object] | None) -> dict[str, object] | None:
     if not isinstance(risk_assessment, dict):
         return None
@@ -81,20 +139,42 @@ def _extract_risk_visibility_fields(item: ScanResult) -> dict[str, object]:
     if not isinstance(risk_breakdown, dict):
         risk_breakdown = _extract_risk_breakdown(risk_assessment)
 
+    item_suppression_reason = item.risk_suppression_reason if isinstance(item.risk_suppression_reason, str) else None
+    item_analysis_status = item.analysis_status if isinstance(item.analysis_status, str) else None
+    item_analysis_coverage = item.analysis_coverage if isinstance(item.analysis_coverage, str) else None
+
     return {
         "risk_breakdown": risk_breakdown,
         "risk_overall_status": risk_assessment.get("overall_status") if isinstance(risk_assessment, dict) else None,
         "risk_overall_score": risk_assessment.get("overall_score") if isinstance(risk_assessment, dict) else None,
         "risk_allowlisted": _to_bool(item.risk_allowlisted, bool(risk_assessment.get("allowlisted", False)) if isinstance(risk_assessment, dict) else False),
         "risk_suppressed": _to_bool(item.risk_suppressed, bool(risk_assessment.get("suppressed", False)) if isinstance(risk_assessment, dict) else False),
-        "risk_suppression_reason": item.risk_suppression_reason or (risk_assessment.get("suppression_reason") if isinstance(risk_assessment, dict) else None),
-        "analysis_status": item.analysis_status or (dynamic_meta.get("status") if isinstance(dynamic_meta, dict) else None),
-        "analysis_coverage": item.analysis_coverage or (dynamic_meta.get("coverage") if isinstance(dynamic_meta, dict) else None),
+        "risk_suppression_reason": item_suppression_reason or (risk_assessment.get("suppression_reason") if isinstance(risk_assessment, dict) else None),
+        "analysis_status": item_analysis_status or (dynamic_meta.get("status") if isinstance(dynamic_meta, dict) else None),
+        "analysis_coverage": item_analysis_coverage or (dynamic_meta.get("coverage") if isinstance(dynamic_meta, dict) else None),
         "advisory_references": item.advisory_references if isinstance(item.advisory_references, list) else _to_string_list(risk_assessment.get("advisory_references") if isinstance(risk_assessment, dict) else None),
     }
 
 
+def _derive_analyzed_by(item: ScanResult) -> list[str]:
+    """Derive which analysis microservices ran for this package result."""
+    ra = item.risk_assessment if isinstance(item.risk_assessment, dict) else {}
+    analysis_mode = ra.get("analysis_mode", "")
+
+    analyzed_by: list[str] = []
+
+    if analysis_mode != "dynamic_only":
+        analyzed_by.append("static")
+
+    analysis_status = item.analysis_status if isinstance(item.analysis_status, str) else None
+    if analysis_status and analysis_status not in {"skipped", "not_malicious", "mode_excluded"}:
+        analyzed_by.append("dynamic")
+
+    return analyzed_by or ["static"]
+
+
 def _to_scan_result_response(item: ScanResult) -> ScanResultResponse:
+    ra = item.risk_assessment if isinstance(item.risk_assessment, dict) else None
     payload = {
         "id": item.id,
         "package_name": item.package_name,
@@ -106,20 +186,29 @@ def _to_scan_result_response(item: ScanResult) -> ScanResultResponse:
         "error_message": item.error_message,
         "scan_timestamp": item.scan_timestamp,
         "risk_assessment": item.risk_assessment,
+        "analyzed_by": _derive_analyzed_by(item),
+        "reputation_metadata": _extract_reputation_metadata(ra),
+        "vulnerability_details": _extract_vulnerability_details(ra),
     }
     payload.update(_extract_risk_visibility_fields(item))
+    payload.update(_extract_scan_detail_fields(ra))
     return ScanResultResponse.model_validate(payload)
 
 
 def _to_scan_result_map_entry(item: ScanResult) -> ScanResultMapEntry:
+    ra = item.risk_assessment if isinstance(item.risk_assessment, dict) else None
     payload = {
         "malware_status": item.malware_status,
         "malware_score": item.malware_score,
         "scan_timestamp": item.scan_timestamp,
         "scanner_version": item.scanner_version,
-        "risk_assessment": item.risk_assessment,
+        "risk_assessment": ra,
+        "analyzed_by": _derive_analyzed_by(item),
+        "reputation_metadata": _extract_reputation_metadata(ra),
+        "vulnerability_details": _extract_vulnerability_details(ra),
     }
     payload.update(_extract_risk_visibility_fields(item))
+    payload.update(_extract_scan_detail_fields(ra))
     return ScanResultMapEntry.model_validate(payload)
 
 
@@ -153,6 +242,7 @@ async def trigger_scan(
         owner=owner,
         repo_name=repo_name,
         ecosystem=body.ecosystem,
+        scan_mode=body.scan_mode,
         status="pending",
     )
     db.add(job)
@@ -168,6 +258,7 @@ async def trigger_scan(
             ecosystem=body.ecosystem,
             access_token=current_user.access_token,
             selected_packages=body.selected_packages,
+            scan_mode=body.scan_mode,
         )
     )
 
@@ -310,6 +401,7 @@ async def get_latest_scan_job(
             owner=job.owner,
             repo_name=job.repo_name,
             ecosystem=job.ecosystem,
+            scan_mode=_job_scan_mode(job),
             status=job.status,
             total_packages=total_packages,
             scanned_packages=scanned,
@@ -389,6 +481,167 @@ async def get_latest_scan_results(
     }
 
 
+# ── Scan history ──────────────────────────────────────────────────────
+
+@router.get(
+    "/{owner}/{repo_name}/scan/history",
+    response_model=ScanHistoryResponse,
+)
+async def get_scan_history(
+    owner: str,
+    repo_name: str,
+    page: int = Query(default=1, ge=1, description="Page number (1-based)"),
+    per_page: int = Query(default=20, ge=1, le=100, description="Results per page"),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> ScanHistoryResponse:
+    """Return a paginated list of all scan jobs for a repository, newest first.
+
+    Each entry shows the scan mode, status, package counts and timestamps.
+    Use ``GET /{owner}/{repo_name}/scan/{job_id}`` to fetch full results for
+    any entry, including per-package static features and dynamic findings.
+    """
+    offset = (page - 1) * per_page
+    base_filter = and_(ScanJob.owner == owner, ScanJob.repo_name == repo_name)
+
+    total = (
+        await db.execute(select(func.count()).select_from(ScanJob).where(base_filter))
+    ).scalar_one()
+
+    rows = (
+        await db.execute(
+            select(ScanJob)
+            .where(base_filter)
+            .order_by(ScanJob.created_at.desc())
+            .offset(offset)
+            .limit(per_page)
+        )
+    ).scalars().all()
+
+    # Build per-job aggregated stats with two queries covering all jobs on the page.
+    job_ids = [j.id for j in rows]
+    job_status_stats: dict[object, dict[str, int]] = {}
+    job_cve_stats: dict[object, tuple[int, int]] = {}  # job_id → (packages_with_cves, total_cve_count)
+
+    if job_ids:
+        # Status distribution: one GROUP BY query for the whole page.
+        status_rows = (
+            await db.execute(
+                select(ScanResult.job_id, ScanResult.malware_status, func.count().label("cnt"))
+                .where(ScanResult.job_id.in_(job_ids))
+                .group_by(ScanResult.job_id, ScanResult.malware_status)
+            )
+        ).all()
+        for row in status_rows:
+            stats = job_status_stats.setdefault(row.job_id, {})
+            stats[row.malware_status or "unknown"] = int(row.cnt)
+
+        # CVE counts: load (job_id, advisory_references) and aggregate in Python.
+        cve_rows = (
+            await db.execute(
+                select(ScanResult.job_id, ScanResult.advisory_references)
+                .where(ScanResult.job_id.in_(job_ids))
+            )
+        ).all()
+        for row in cve_rows:
+            refs = row.advisory_references if isinstance(row.advisory_references, list) else []
+            if refs:
+                pkg_count, total_count = job_cve_stats.get(row.job_id, (0, 0))
+                job_cve_stats[row.job_id] = (pkg_count + 1, total_count + len(refs))
+
+    def _to_history_summary(j: ScanJob) -> ScanHistorySummary:
+        stats = job_status_stats.get(j.id, {})
+        pkgs_with_cves, total_cves = job_cve_stats.get(j.id, (0, 0))
+        return ScanHistorySummary(
+            id=j.id,
+            repo_name=j.repo_name if isinstance(j.repo_name, str) else "",
+            ecosystem=j.ecosystem if isinstance(j.ecosystem, str) else "",
+            scan_mode=_job_scan_mode(j),
+            status=j.status if isinstance(j.status, str) else "",
+            total_packages=_to_int(j.total_packages),
+            processed_packages=_to_int(getattr(j, "processed_packages", None)),
+            scanned_packages=_to_int(j.scanned_packages),
+            total_dependency_nodes=_to_int(getattr(j, "total_dependency_nodes", None)),
+            total_unique_packages=_to_int(getattr(j, "total_unique_packages", None)),
+            error_message=j.error_message if isinstance(j.error_message, str) else None,
+            created_at=j.created_at,
+            started_at=j.started_at if isinstance(j.started_at, datetime) else None,
+            completed_at=j.completed_at if isinstance(j.completed_at, datetime) else None,
+            malicious_count=stats.get("malicious", 0),
+            clean_count=stats.get("clean", 0),
+            error_count=stats.get("error", 0),
+            unknown_count=stats.get("unknown", 0),
+            packages_with_cves=pkgs_with_cves,
+            total_cve_count=total_cves,
+        )
+
+    return ScanHistoryResponse(
+        jobs=[_to_history_summary(j) for j in rows],
+        total=total,
+        page=page,
+        per_page=per_page,
+    )
+
+
+# ── Job results (searchable, paginated) ───────────────────────────────
+
+@router.get(
+    "/{owner}/{repo_name}/scan/{job_id}/results",
+    response_model=ScanJobResultsResponse,
+)
+async def get_scan_job_results(
+    owner: str,
+    repo_name: str,
+    job_id: UUID,
+    q: str | None = Query(default=None, max_length=214, description="Filter by package name (case-insensitive substring)"),
+    malware_status: str | None = Query(default=None, pattern=r"^(clean|malicious|error|unknown)$"),
+    page: int = Query(default=1, ge=1),
+    per_page: int = Query(default=20, ge=1, le=100),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> ScanJobResultsResponse:
+    """Return paginated, searchable per-package results for a scan job."""
+    del current_user
+
+    job_stmt = select(ScanJob).where(
+        ScanJob.id == job_id,
+        ScanJob.owner == owner,
+        ScanJob.repo_name == repo_name,
+    )
+    job = (await db.execute(job_stmt)).scalar_one_or_none()
+    if job is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scan job not found")
+
+    base_filter = [ScanResult.job_id == job_id]
+    if q:
+        base_filter.append(ScanResult.package_name.ilike(f"%{q}%"))
+    if malware_status:
+        base_filter.append(ScanResult.malware_status == malware_status)
+
+    total = (
+        await db.execute(select(func.count()).select_from(ScanResult).where(and_(*base_filter)))
+    ).scalar_one()
+
+    offset = (page - 1) * per_page
+    rows = (
+        await db.execute(
+            select(ScanResult)
+            .where(and_(*base_filter))
+            .order_by(ScanResult.scan_timestamp.desc())
+            .offset(offset)
+            .limit(per_page)
+        )
+    ).scalars().all()
+
+    return ScanJobResultsResponse(
+        job_id=job_id,
+        total=total,
+        page=page,
+        per_page=per_page,
+        results=[_to_scan_result_response(r) for r in rows],
+    )
+
+
 # ── Status / results ──────────────────────────────────────────────────
 
 @router.get(
@@ -463,6 +716,7 @@ async def get_scan_job(
         owner=job.owner,
         repo_name=job.repo_name,
         ecosystem=job.ecosystem,
+        scan_mode=getattr(job, "scan_mode", "full") or "full",
         status=job.status,
         total_packages=total_packages,
         scanned_packages=scanned,
