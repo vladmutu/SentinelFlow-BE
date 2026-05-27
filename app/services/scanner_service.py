@@ -687,7 +687,7 @@ def _build_policy_signals(
         )
         evidence.append("policy:low_confidence")
 
-    if not suppressed and has_reputation_override and not has_vulnerability_evidence and confidence_value < 0.7:
+    if not suppressed and has_reputation_override and not has_vulnerability_evidence and confidence_value < 0.5:
         suppressed = True
         suppression_reason = "reputation_offset"
         policy_signals.append(
@@ -737,7 +737,10 @@ def _build_policy_signals(
 _SCAN_MODE_TO_ANALYSIS_MODE: dict[str, str] = {
     "full": "static-classifier",
     "static_only": "static-classifier",
+    "static_classifier": "static-classifier",
     "lightweight": "lightweight",
+    "lightweight_cve": "lightweight",
+    "lightweight_librariesio": "lightweight",
     "dynamic_only": "dynamic_only",
 }
 
@@ -782,9 +785,14 @@ def build_package_risk_assessment(
         rationale="Thresholded ML classifier output from extracted package features",
         metadata={"scanner_version": verdict.scanner_version},
     )
-    structured_static_signals, static_evidence, static_metadata = _build_static_signals(
-        verdict.feature_snapshot
-    )
+    if scan_mode == "static_classifier":
+        structured_static_signals: list[RiskSignal] = []
+        static_evidence: list[str] = []
+        static_metadata: dict[str, Any] = {"context_markers": {}}
+    else:
+        structured_static_signals, static_evidence, static_metadata = _build_static_signals(
+            verdict.feature_snapshot
+        )
 
     static_signals = [
         classifier_signal,

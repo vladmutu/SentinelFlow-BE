@@ -7,7 +7,6 @@ Never executes untrusted package code on the API host.
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
 import logging
 from urllib.parse import urlparse
@@ -27,14 +26,6 @@ class DynamicAnalysisResult:
     metadata: dict[str, object]
 
 
-@dataclass
-class _CachedDynamicResult:
-    expires_at: datetime
-    result: DynamicAnalysisResult
-
-
-_dynamic_cache_lock = asyncio.Lock()
-_dynamic_cache: dict[tuple[str, str, str], _CachedDynamicResult] = {}
 _dynamic_semaphore: asyncio.Semaphore | None = None
 
 
@@ -231,12 +222,6 @@ async def analyze_package_dynamically(
 
     analyze_url = f"{base_url.rstrip('/')}/analyze"
 
-    cache_key = (ecosystem.lower(), package_name.lower(), package_version)
-    now = datetime.now(timezone.utc)
-    cached = _dynamic_cache.get(cache_key)
-    if cached is not None and cached.expires_at > now:
-        return cached.result
-
     request_payload: dict[str, object] = {
         "ecosystem": ecosystem,
         "package_name": package_name,
@@ -316,12 +301,6 @@ async def analyze_package_dynamically(
             )
             result = _normalize_remote_response(payload)
 
-        ttl_seconds = max(30, settings.dynamic_analysis_cache_ttl_seconds)
-        async with _dynamic_cache_lock:
-            _dynamic_cache[cache_key] = _CachedDynamicResult(
-                expires_at=now + timedelta(seconds=ttl_seconds),
-                result=result,
-            )
         return result
 
     except httpx.ConnectError as exc:

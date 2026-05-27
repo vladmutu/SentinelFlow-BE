@@ -398,12 +398,16 @@ async def _enrich_from_librariesio(
             params=params,
         )
         if resp.is_error:
+            error_key = "libraries_io_not_found" if resp.status_code == 404 else "libraries_io_error"
+            result.metadata[error_key] = resp.status_code
             return result
 
         data = resp.json()
         if not isinstance(data, dict):
+            result.metadata["libraries_io_error"] = "invalid_response"
             return result
-    except (httpx.RequestError, ValueError):
+    except (httpx.RequestError, ValueError) as exc:
+        result.metadata["libraries_io_error"] = type(exc).__name__
         return result
 
     source_rank = data.get("rank")
@@ -427,7 +431,7 @@ async def _enrich_from_librariesio(
         extra_signals.append(RiskSignal(
             source="reputation",
             name="high_source_rank",
-            value=min(float(source_rank) / 30.0, 1.0),
+            value=min(float(source_rank) / 20.0, 1.0),
             weight=0.5,
             confidence=0.8,
             rationale="Libraries.io SourceRank indicates a well-maintained project",
@@ -440,7 +444,7 @@ async def _enrich_from_librariesio(
         extra_signals.append(RiskSignal(
             source="reputation",
             name="high_dependents",
-            value=min(dependents_count / 1000.0, 1.0),
+            value=min(dependents_count / 100.0, 1.0),
             weight=0.4,
             confidence=0.85,
             rationale="Many other packages depend on this package",

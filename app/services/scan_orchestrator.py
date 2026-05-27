@@ -9,11 +9,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from uuid import UUID
 
 import httpx
-from sqlalchemy import and_, case, desc, select, update
+from sqlalchemy import and_, case, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -30,9 +30,6 @@ from app.services import (
 logger = logging.getLogger(__name__)
 
 _TASK_PENDING = "pending"
-_TASK_DOWNLOADING = "downloading"
-_TASK_ANALYZING = "analyzing"
-_TASK_CLASSIFYING = "classifying"
 _TASK_DONE = "done"
 _TASK_FAILED = "failed"
 _TASK_TERMINAL_STATES = {_TASK_DONE, _TASK_FAILED}
@@ -62,22 +59,39 @@ async def run_scan_job(
                 "X-GitHub-Api-Version": "2022-11-28",
             }
 
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                if ecosystem == "npm":
-                    manifest = await manifest_utils.fetch_npm_manifest(client, owner, repo, headers)
-                    tree = await manifest_utils.resolve_npm_dependency_tree(client, manifest)
-                    workload = manifest_utils.build_npm_scan_workload(manifest, tree)
-                    packages = workload.refs
-                    total_dependency_nodes = workload.total_dependency_nodes
-                    total_unique_packages = workload.unique_packages
-                elif ecosystem == "pypi":
-                    manifest = await manifest_utils.fetch_pypi_manifest(client, owner, repo, headers)
-                    tree = await manifest_utils.build_pypi_dependency_tree_deep(client, manifest)
-                    packages = manifest_utils.flatten_dependencies(tree)
-                    total_dependency_nodes = manifest_utils.count_dependency_nodes(tree)
-                    total_unique_packages = len(packages)
-                else:
-                    raise ValueError(f"Unsupported ecosystem: {ecosystem}")
+            _DEP_RESOLVE_TIMEOUT = 90  # seconds
+            try:
+                async with asyncio.timeout(_DEP_RESOLVE_TIMEOUT):
+                    async with httpx.AsyncClient(timeout=30.0) as client:
+                        if ecosystem == "npm":
+                            manifest = await manifest_utils.fetch_npm_manifest(client, owner, repo, headers)
+                            tree = await manifest_utils.resolve_npm_dependency_tree(client, manifest)
+                            workload = manifest_utils.build_npm_scan_workload(manifest, tree)
+                            packages = workload.refs
+                            total_dependency_nodes = workload.total_dependency_nodes
+                            total_unique_packages = workload.unique_packages
+                        elif ecosystem == "pypi":
+                            manifest = await manifest_utils.fetch_pypi_manifest(client, owner, repo, headers)
+                            tree = await manifest_utils.build_pypi_dependency_tree_deep(client, manifest)
+                            packages = manifest_utils.flatten_dependencies(tree)
+                            total_dependency_nodes = manifest_utils.count_dependency_nodes(tree)
+                            total_unique_packages = len(packages)
+                        else:
+                            raise ValueError(f"Unsupported ecosystem: {ecosystem}")
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Dependency resolution timed out after %ss for job %s",
+                    _DEP_RESOLVE_TIMEOUT,
+                    job_id,
+                )
+                await _set_job_status(
+                    db,
+                    job_id,
+                    "failed",
+                    error_message=f"Dependency resolution timed out after {_DEP_RESOLVE_TIMEOUT}s",
+                    completed_at=datetime.now(timezone.utc),
+                )
+                return
 
             packages = _filter_selected_packages(packages, selected_packages)
             total_unique_packages = len(packages)
@@ -122,8 +136,7 @@ async def run_scan_job(
             await db.flush()
             await db.commit()
 
-            for task in tasks:
-                await enqueue_scan_task(task.id, scan_mode)
+            await asyncio.gather(*(enqueue_scan_task(t.id, scan_mode) for t in tasks))
 
         except Exception as exc:
             logger.exception("Scan job %s failed during orchestration", job_id)
@@ -253,23 +266,26 @@ async def _scan_single_package(task_id: UUID, scan_mode: str = "full") -> None:
         await _set_task_status(task_id, _TASK_DONE)
         return
 
-    if await _try_reuse_recent_scan_result(task_id, task):
-        return
-
     # Phase flags derived from scan_mode
-    # full        → static → CVE+libraries.io (if risky) → dynamic (if still risky)
-    # static_only → static → CVE+libraries.io (if risky); no dynamic
-    # lightweight → CVE for all packages; libraries.io only for direct deps or CVE-positive packages
-    # dynamic_only → dynamic only; no static, no CVE, no libraries.io
+    # full                  → static → CVE+libraries.io (if risky) → dynamic (if still risky)
+    # static_only           → static → CVE+libraries.io (if risky); no dynamic
+    # static_classifier     → static only; no CVE / libraries.io / dynamic
+    # lightweight           → CVE + libraries.io for all packages; no static, no dynamic
+    # lightweight_cve       → CVE lookup only (OSV+NVD); no libraries.io, no static, no dynamic
+    # lightweight_librariesio → Libraries.io only; no CVE, no static, no dynamic
+    # dynamic_only          → dynamic only; no static, no CVE, no libraries.io
     STATIC_RISK_ENRICHMENT_THRESHOLD = 0.5
 
-    run_static    = scan_mode in {"full", "static_only"}
+    run_static    = scan_mode in {"full", "static_only", "static_classifier"}
+    run_static_enrichment = scan_mode in {"full", "static_only"}
     force_dynamic = scan_mode == "dynamic_only"
-    run_lightweight = scan_mode == "lightweight"
+    run_lightweight = scan_mode in {"lightweight", "lightweight_cve", "lightweight_librariesio"}
+    run_lightweight_cve = scan_mode in {"lightweight", "lightweight_cve"}
+    run_lightweight_rep = scan_mode in {"lightweight", "lightweight_librariesio"}
+
+    _scanned_incremented = False
 
     try:
-        await _set_task_status(task_id, _TASK_ANALYZING)
-
         # ── Step 1: Static analysis ──────────────────────────────────────────
         if run_static:
             verdict = await scanner_service.analyze_package_static(
@@ -278,25 +294,40 @@ async def _scan_single_package(task_id: UUID, scan_mode: str = "full") -> None:
                 task.package_version,
                 task.ecosystem,
             )
+            # Increment scanned counter right after static so the UI shows
+            # per-package progress without waiting for CVE/dynamic to finish.
+            async with AsyncSessionLocal() as _db:
+                await _increment_scanned_once(_db, task.job_id)
+                await _db.commit()
+            _scanned_incremented = True
         else:
             verdict = scanner_service.ScanVerdict(malware_status="unknown", malware_score=None)
 
-        await _set_task_status(task_id, _TASK_CLASSIFYING)
         dependency_context = getattr(task, "dependency_context", None)
         dep_ctx = dependency_context if isinstance(dependency_context, dict) else {}
         is_direct_dep = bool(dep_ctx.get("is_direct_dependency", False))
 
         # ── Step 2: Determine enrichment need ───────────────────────────────
-        # For lightweight: always enrich all packages with CVE + libraries.io.
-        # For full/static_only: only enrich if static analysis flags the package as risky.
+        # lightweight modes: always enrich all packages; full: always enrich all packages;
+        # static_only: only if risky.
         static_is_risky = (
             verdict.malware_status == "malicious"
             or (verdict.malware_score is not None and verdict.malware_score > STATIC_RISK_ENRICHMENT_THRESHOLD)
         )
-        should_enrich = run_lightweight or (run_static and static_is_risky)
+        run_full_enrichment = scan_mode == "full"
+        should_enrich_cve = run_full_enrichment or run_lightweight_cve or (run_static_enrichment and static_is_risky)
+        should_enrich_rep = run_full_enrichment or run_lightweight_rep or (run_static_enrichment and static_is_risky)
+
+        # Explicitly ensure `static_classifier` (triggered from the static-analysis
+        # tab) never performs any lightweight enrichment. This makes the intent
+        # explicit and protects against any future logic paths that might use
+        # `run_static` instead of `run_static_enrichment`.
+        if scan_mode == "static_classifier":
+            should_enrich_cve = False
+            should_enrich_rep = False
 
         # ── Step 3: CVE lookup (OSV/NVD) ─────────────────────────────────────
-        if should_enrich:
+        if should_enrich_cve:
             vulnerability_result = await vulnerability_service.lookup_package_vulnerabilities(
                 task.ecosystem,
                 task.package_name,
@@ -308,10 +339,7 @@ async def _scan_single_package(task_id: UUID, scan_mode: str = "full") -> None:
             )
 
         # ── Step 4: Libraries.io / reputation ────────────────────────────────
-        # For lightweight mode: Libraries.io is only called when CVEs were found or the
-        # package is a direct dependency. This keeps well within the 60 req/min limit
-        # since most packages in a healthy project have no CVEs.
-        if should_enrich:
+        if should_enrich_rep:
             has_cves = len(vulnerability_result.signals) > 0
             try:
                 reputation_result = await reputation_service.lookup_package_reputation(
@@ -319,7 +347,7 @@ async def _scan_single_package(task_id: UUID, scan_mode: str = "full") -> None:
                     task.package_name,
                     task.package_version,
                     is_direct_dependency=is_direct_dep,
-                    force_librariesio=is_direct_dep or has_cves,
+                    force_librariesio=run_lightweight_rep or is_direct_dep or has_cves or (run_static_enrichment and static_is_risky),
                 )
             except Exception:
                 logger.warning(
@@ -337,7 +365,7 @@ async def _scan_single_package(task_id: UUID, scan_mode: str = "full") -> None:
 
         # ── Step 5: Dynamic analysis (full mode only, if still risky) ────────
         run_dynamic = force_dynamic or (
-            scan_mode == "full" and _should_run_dynamic_analysis(verdict, reputation_result)
+            scan_mode == "full" and _should_run_dynamic_analysis(verdict, reputation_result, vulnerability_result)
         )
         if run_dynamic:
             dynamic_result = await dynamic_analysis_service.analyze_package_dynamically(
@@ -347,7 +375,7 @@ async def _scan_single_package(task_id: UUID, scan_mode: str = "full") -> None:
             )
         else:
             skip_reason = (
-                "mode_excluded" if scan_mode in {"static_only", "lightweight"}
+                "mode_excluded" if scan_mode in {"static_only", "static_classifier", "lightweight", "lightweight_cve", "lightweight_librariesio"}
                 else "not_malicious"
             )
             dynamic_result = dynamic_analysis_service.build_skipped_dynamic_result(
@@ -382,6 +410,7 @@ async def _scan_single_package(task_id: UUID, scan_mode: str = "full") -> None:
                 task_id,
                 verdict.error_message or "Classifier returned error",
                 risk_assessment=risk_assessment,
+                also_scanned=False,  # scanned_packages already incremented after static
             )
             return
 
@@ -403,11 +432,11 @@ async def _scan_single_package(task_id: UUID, scan_mode: str = "full") -> None:
             reputation_evidence=reputation_result.evidence,
             reputation_metadata=reputation_result.metadata,
         )
-        await _set_task_done(task_id, verdict, risk_assessment=risk_assessment)
+        await _set_task_done(task_id, verdict, risk_assessment=risk_assessment, also_scanned=not run_static)
 
     except Exception as exc:
         logger.exception("Task %s failed", task_id)
-        await _set_task_failed(task_id, str(exc))
+        await _set_task_failed(task_id, str(exc), also_scanned=not _scanned_incremented)
 
 
 def _derive_verdict_from_dynamic(
@@ -443,56 +472,40 @@ def _derive_verdict_from_dynamic(
     return scanner_service.ScanVerdict(malware_status="unknown", malware_score=None)
 
 
+DYNAMIC_ANALYSIS_SCORE_THRESHOLD = 0.55
+
+
 def _should_run_dynamic_analysis(
     verdict: scanner_service.ScanVerdict,
     reputation_result: reputation_service.ReputationLookupResult | None = None,
+    vulnerability_result: vulnerability_service.VulnerabilityLookupResult | None = None,
 ) -> bool:
     if not settings.dynamic_analysis_enabled:
         return False
-    if verdict.malware_status != "malicious":
+
+    has_cves = vulnerability_result is not None and len(vulnerability_result.signals) > 0
+
+    # Run dynamic if the static classifier explicitly flagged the package, if the
+    # continuous score is near the malicious boundary, or if known CVEs exist.
+    flagged = (
+        verdict.malware_status == "malicious"
+        or (verdict.malware_score is not None and verdict.malware_score >= settings.dynamic_analysis_priority_threshold)
+        or has_cves
+    )
+    if not flagged:
         return False
-    # If libraries.io says the package is highly trusted, skip dynamic analysis —
-    # a high static score for a well-known package is likely a false positive.
+
+    # Skip dynamic if the package has strong reputation AND no CVEs — the
+    # reputation_override policy will suppress the score to clean anyway.
     if reputation_result is not None:
         trust = reputation_result.metadata.get("trust_score", 0.0)
-        if isinstance(trust, float) and trust >= 0.8:
+        if isinstance(trust, float) and trust >= 0.8 and not has_cves:
             logger.info(
-                "Skipping dynamic analysis for high-trust package (trust_score=%.2f)", trust
+                "Skipping dynamic analysis for high-trust package with no CVEs (trust_score=%.2f)", trust
             )
             return False
     return True
 
-
-
-def _augment_cached_risk_assessment(risk_assessment: object | None, *, source_result_id: UUID) -> object | None:
-    if not isinstance(risk_assessment, dict):
-        return risk_assessment
-
-    payload = dict(risk_assessment)
-    metadata = payload.get("metadata")
-    if not isinstance(metadata, dict):
-        metadata = {}
-    cache_meta = metadata.get("cache")
-    if not isinstance(cache_meta, dict):
-        cache_meta = {}
-    cache_meta.update(
-        {
-            "reused": True,
-            "source_result_id": str(source_result_id),
-            "reused_at": datetime.now(timezone.utc).isoformat(),
-        }
-    )
-    metadata["cache"] = cache_meta
-    payload["metadata"] = metadata
-
-    evidence = payload.get("evidence")
-    if isinstance(evidence, list):
-        if "cache:scan_result_reuse" not in evidence:
-            payload["evidence"] = [*evidence, "cache:scan_result_reuse"]
-    else:
-        payload["evidence"] = ["cache:scan_result_reuse"]
-
-    return payload
 
 
 def _extract_result_risk_fields(risk_assessment: object | None) -> dict[str, object]:
@@ -531,55 +544,6 @@ def _extract_result_risk_fields(risk_assessment: object | None) -> dict[str, obj
     }
 
 
-async def _find_recent_cached_result(task: ScanTask) -> ScanResult | None:
-    if not settings.scan_result_reuse_enabled:
-        return None
-
-    ttl_seconds = max(0, settings.scan_result_reuse_ttl_seconds)
-    if ttl_seconds <= 0:
-        return None
-
-    cutoff = datetime.now(timezone.utc) - timedelta(seconds=ttl_seconds)
-    async with AsyncSessionLocal() as db:
-        stmt = (
-            select(ScanResult)
-            .where(
-                ScanResult.package_name == task.package_name,
-                ScanResult.package_version == task.package_version,
-                ScanResult.ecosystem == task.ecosystem,
-                ScanResult.job_id != task.job_id,
-                ScanResult.malware_status != "error",
-                ScanResult.scan_timestamp >= cutoff,
-            )
-            .order_by(desc(ScanResult.scan_timestamp))
-            .limit(1)
-        )
-        return (await db.execute(stmt)).scalar_one_or_none()
-
-
-async def _try_reuse_recent_scan_result(task_id: UUID, task: ScanTask) -> bool:
-    cached = await _find_recent_cached_result(task)
-    if cached is None:
-        return False
-
-    await _set_task_status(task_id, _TASK_DOWNLOADING)
-    cached_verdict = scanner_service.ScanVerdict(
-        malware_status=cached.malware_status,
-        malware_score=cached.malware_score,
-        scanner_version=cached.scanner_version,
-        error_message=cached.error_message,
-    )
-    await _set_task_done(
-        task_id,
-        cached_verdict,
-        risk_assessment=_augment_cached_risk_assessment(
-            cached.risk_assessment,
-            source_result_id=cached.id,
-        ),
-    )
-    return True
-
-
 async def _is_job_cancelled(job_id: UUID) -> bool:
     """Return whether a scan job is currently marked as cancelled."""
     async with AsyncSessionLocal() as db:
@@ -607,8 +571,6 @@ async def _set_task_status(task_id: UUID, status: str) -> None:
         now = datetime.now(timezone.utc)
         task.status = status
         task.updated_at = now
-        if status in {_TASK_DOWNLOADING, _TASK_ANALYZING} and task.started_at is None:
-            task.started_at = now
         await db.commit()
 
 
@@ -617,6 +579,7 @@ async def _set_task_done(
     verdict: scanner_service.ScanVerdict,
     *,
     risk_assessment: object | None = None,
+    also_scanned: bool = False,
 ) -> None:
     async with AsyncSessionLocal() as db:
         stmt = select(ScanTask).where(ScanTask.id == task_id)
@@ -638,7 +601,7 @@ async def _set_task_done(
             scanner_version=verdict.scanner_version,
             risk_assessment=risk_assessment,
         )
-        await _increment_processed_once(db, task.job_id)
+        await _increment_processed_once(db, task.job_id, also_scanned=also_scanned)
         await db.commit()
 
 
@@ -647,6 +610,7 @@ async def _set_task_failed(
     error_message: str,
     *,
     risk_assessment: object | None = None,
+    also_scanned: bool = False,
 ) -> None:
     async with AsyncSessionLocal() as db:
         stmt = select(ScanTask).where(ScanTask.id == task_id)
@@ -667,7 +631,7 @@ async def _set_task_failed(
             scanner_version=scanner_service.SCANNER_VERSION,
             risk_assessment=risk_assessment,
         )
-        await _increment_processed_once(db, task.job_id)
+        await _increment_processed_once(db, task.job_id, also_scanned=also_scanned)
         await db.commit()
 
 
@@ -763,22 +727,33 @@ def _serialize_risk_assessment(risk_assessment: object | None) -> dict[str, obje
     raise TypeError(f"Unsupported risk assessment payload: {type(risk_assessment)!r}")
 
 
-async def _increment_processed_once(db: AsyncSession, job_id: UUID) -> None:
+async def _increment_scanned_once(db: AsyncSession, job_id: UUID) -> None:
+    stmt = (
+        update(ScanJob)
+        .where(ScanJob.id == job_id)
+        .values(scanned_packages=ScanJob.scanned_packages + 1)
+    )
+    await db.execute(stmt)
+
+
+async def _increment_processed_once(db: AsyncSession, job_id: UUID, *, also_scanned: bool = False) -> None:
     now = datetime.now(timezone.utc)
     will_complete = and_(
         ScanJob.status == "running",
         ScanJob.total_packages > 0,
         (ScanJob.processed_packages + 1) >= ScanJob.total_packages,
     )
+    new_values: dict = {
+        "processed_packages": ScanJob.processed_packages + 1,
+        "status": case((will_complete, "completed"), else_=ScanJob.status),
+        "completed_at": case((will_complete, now), else_=ScanJob.completed_at),
+    }
+    if also_scanned:
+        new_values["scanned_packages"] = ScanJob.scanned_packages + 1
     stmt = (
         update(ScanJob)
         .where(ScanJob.id == job_id)
-        .values(
-            processed_packages=ScanJob.processed_packages + 1,
-            scanned_packages=ScanJob.scanned_packages + 1,
-            status=case((will_complete, "completed"), else_=ScanJob.status),
-            completed_at=case((will_complete, now), else_=ScanJob.completed_at),
-        )
+        .values(**new_values)
     )
     await db.execute(stmt)
 

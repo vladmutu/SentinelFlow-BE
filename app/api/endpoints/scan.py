@@ -13,6 +13,7 @@ import logging
 from typing import Optional
 from uuid import UUID
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -29,6 +30,7 @@ from app.api.schemas.scan import (
     ScanTriggerRequest,
     ScanTriggerResponse,
 )
+from app.core.config import settings
 from app.db.session import get_db
 from app.models.scan import ScanJob, ScanResult
 from app.models.user import User
@@ -89,7 +91,7 @@ def _extract_reputation_metadata(risk_assessment: dict[str, object] | None) -> d
     keys = (
         "monthly_downloads", "package_age_days", "has_repository",
         "maintainer_count", "libraries_io_rank", "dependents_count",
-        "stars", "trust_score",
+        "stars", "forks", "trust_score",
     )
     result = {k: rep[k] for k in keys if k in rep}
     return result or None
@@ -108,13 +110,43 @@ def _extract_vulnerability_details(risk_assessment: dict[str, object] | None) ->
         if not advisory_id:
             continue
         details.append({
-            "id": advisory_id,
+            "advisory_id": advisory_id,
             "source": signal.get("source", "unknown"),
-            "cvss_score": signal.get("value"),
-            "description": meta.get("details") or meta.get("description"),
+            "value": signal.get("value"),
+            "details": meta.get("details") or meta.get("description"),
             "aliases": meta.get("aliases") or [],
         })
     return details
+
+
+def _extract_lookup_status(risk_assessment: dict[str, object] | None) -> dict[str, str] | None:
+    """Derive per-source lookup outcome so the frontend can flag missing or failed lookups."""
+    if not isinstance(risk_assessment, dict):
+        return None
+    metadata = risk_assessment.get("metadata") or {}
+    status: dict[str, str] = {}
+
+    vuln_meta = metadata.get("vulnerability") or {}
+    if isinstance(vuln_meta, dict):
+        if vuln_meta.get("skipped"):
+            status["cve"] = "skipped"
+        elif vuln_meta.get("osv_error") or vuln_meta.get("nvd_error"):
+            status["cve"] = "error"
+        else:
+            status["cve"] = "ok"
+
+    rep_meta = metadata.get("reputation") or {}
+    if isinstance(rep_meta, dict):
+        if rep_meta.get("skipped"):
+            status["librariesio"] = "skipped"
+        elif rep_meta.get("libraries_io_not_found"):
+            status["librariesio"] = "not_found"
+        elif rep_meta.get("libraries_io_error") or rep_meta.get("error") == "lookup_failed":
+            status["librariesio"] = "error"
+        elif rep_meta.get("libraries_io_rank") is not None or rep_meta.get("trust_score") is not None:
+            status["librariesio"] = "found"
+
+    return status or None
 
 
 def _extract_risk_breakdown(risk_assessment: dict[str, object] | None) -> dict[str, object] | None:
@@ -161,16 +193,25 @@ def _derive_analyzed_by(item: ScanResult) -> list[str]:
     ra = item.risk_assessment if isinstance(item.risk_assessment, dict) else {}
     analysis_mode = ra.get("analysis_mode", "")
 
-    analyzed_by: list[str] = []
+    if analysis_mode == "dynamic_only":
+        return ["dynamic"]
 
-    if analysis_mode != "dynamic_only":
-        analyzed_by.append("static")
+    if analysis_mode == "lightweight":
+        metadata = ra.get("metadata") or {}
+        rep_meta = metadata.get("reputation") if isinstance(metadata, dict) else None
+        vuln_meta = metadata.get("vulnerability") if isinstance(metadata, dict) else None
+        analyzed: list[str] = []
+        if isinstance(vuln_meta, dict) and not vuln_meta.get("skipped"):
+            analyzed.append("cve")
+        if isinstance(rep_meta, dict) and not rep_meta.get("skipped"):
+            analyzed.append("librariesio")
+        return analyzed or ["cve"]
 
+    analyzed_by = ["static"]
     analysis_status = item.analysis_status if isinstance(item.analysis_status, str) else None
     if analysis_status and analysis_status not in {"skipped", "not_malicious", "mode_excluded"}:
         analyzed_by.append("dynamic")
-
-    return analyzed_by or ["static"]
+    return analyzed_by
 
 
 def _to_scan_result_response(item: ScanResult) -> ScanResultResponse:
@@ -189,6 +230,7 @@ def _to_scan_result_response(item: ScanResult) -> ScanResultResponse:
         "analyzed_by": _derive_analyzed_by(item),
         "reputation_metadata": _extract_reputation_metadata(ra),
         "vulnerability_details": _extract_vulnerability_details(ra),
+        "lookup_status": _extract_lookup_status(ra),
     }
     payload.update(_extract_risk_visibility_fields(item))
     payload.update(_extract_scan_detail_fields(ra))
@@ -206,6 +248,7 @@ def _to_scan_result_map_entry(item: ScanResult) -> ScanResultMapEntry:
         "analyzed_by": _derive_analyzed_by(item),
         "reputation_metadata": _extract_reputation_metadata(ra),
         "vulnerability_details": _extract_vulnerability_details(ra),
+        "lookup_status": _extract_lookup_status(ra),
     }
     payload.update(_extract_risk_visibility_fields(item))
     payload.update(_extract_scan_detail_fields(ra))
@@ -238,6 +281,21 @@ async def trigger_scan(
     Returns:
         ScanTriggerResponse: Identifier and initial status of the created job.
     """
+    existing_stmt = select(ScanJob).where(
+        ScanJob.owner == owner,
+        ScanJob.repo_name == repo_name,
+        ScanJob.status.in_(["pending", "running"]),
+    )
+    existing_job = (await db.execute(existing_stmt)).scalar_one_or_none()
+    if existing_job is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"A scan is already in progress for this repository (job_id: {existing_job.id}). "
+                "Cancel it or wait for it to finish."
+            ),
+        )
+
     job = ScanJob(
         owner=owner,
         repo_name=repo_name,
@@ -321,6 +379,15 @@ async def cancel_scan(
 
     logger.info(f"Scan job {job_id} cancelled by user {current_user.id}")
 
+    if settings.static_analysis_remote_url:
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                await client.delete(
+                    f"{settings.static_analysis_remote_url.rstrip('/')}/jobs/{job_id}"
+                )
+        except Exception:
+            pass
+
     return {"job_id": job.id, "status": job.status, "message": "Scan cancelled"}
 
 
@@ -373,8 +440,7 @@ async def get_latest_scan_job(
     total_packages = _to_int(job.total_packages, 0)
     total_dependency_nodes = _to_int(job.total_dependency_nodes, 0)
     total_unique = _to_int(job.total_unique_packages, 0) or total_packages
-    processed_raw = _to_int(getattr(job, "processed_packages", None), 0)
-    scanned_raw = processed_raw if processed_raw > 0 else _to_int(job.scanned_packages, 0)
+    scanned_raw = _to_int(job.scanned_packages, 0)
     scanned = min(scanned_raw, total_unique) if total_unique > 0 else scanned_raw
 
     progress_percent = 0.0
@@ -686,8 +752,7 @@ async def get_scan_job(
     total_packages = _to_int(job.total_packages, 0)
     total_dependency_nodes = _to_int(job.total_dependency_nodes, 0)
     total_unique = _to_int(job.total_unique_packages, 0) or total_packages
-    processed_raw = _to_int(getattr(job, "processed_packages", None), 0)
-    scanned_raw = processed_raw if processed_raw > 0 else _to_int(job.scanned_packages, 0)
+    scanned_raw = _to_int(job.scanned_packages, 0)
     scanned = min(scanned_raw, total_unique) if total_unique > 0 else scanned_raw
 
     progress_percent = 0.0

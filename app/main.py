@@ -46,6 +46,33 @@ def create_app() -> FastAPI:
     app.include_router(webhook_router, prefix="/api/webhooks")
 
     @app.on_event("startup")
+    async def _cleanup_interrupted_jobs() -> None:
+        from app.db.session import AsyncSessionLocal
+        from app.models.scan import ScanJob
+        from sqlalchemy import update as sa_update
+        from datetime import datetime, timezone as _tz
+        try:
+            async with AsyncSessionLocal() as db:
+                stmt = (
+                    sa_update(ScanJob)
+                    .where(ScanJob.status.in_(["running", "pending"]))
+                    .values(
+                        status="failed",
+                        error_message="interrupted_by_server_restart",
+                        completed_at=datetime.now(_tz.utc),
+                    )
+                )
+                result = await db.execute(stmt)
+                await db.commit()
+                if result.rowcount:
+                    logger.warning(
+                        "Marked %d interrupted scan job(s) as failed on startup",
+                        result.rowcount,
+                    )
+        except Exception:
+            logger.exception("Failed to clean up interrupted scan jobs on startup")
+
+    @app.on_event("startup")
     async def _startup_ngrok() -> None:
         """Optionally start an ngrok tunnel for webhook development."""
         if not settings.webhook_ngrok_enabled:

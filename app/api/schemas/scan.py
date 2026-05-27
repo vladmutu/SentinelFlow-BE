@@ -26,12 +26,15 @@ class ScanTriggerRequest(BaseModel):
     )
     scan_mode: str = Field(
         default="full",
-        pattern=r"^(full|static_only|lightweight|dynamic_only)$",
+        pattern=r"^(full|static_only|static_classifier|lightweight|lightweight_cve|lightweight_librariesio|dynamic_only)$",
         description=(
             "Analysis pipeline to run. "
             "'full': static + CVE/libraries.io (if risky) + dynamic (if still risky). "
             "'static_only': static + CVE/libraries.io (if risky), no dynamic. "
+            "'static_classifier': static analysis microservice only, no CVE/libraries.io, no dynamic. "
             "'lightweight': CVE + libraries.io lookup only — no static or dynamic. "
+            "'lightweight_cve': CVE lookup only (OSV + NVD), no libraries.io, no static, no dynamic. "
+            "'lightweight_librariesio': Libraries.io reputation only, no CVE, no static, no dynamic. "
             "'dynamic_only': unconditional dynamic analysis only."
         ),
     )
@@ -67,6 +70,8 @@ class ScanResultResponse(BaseModel):
     reputation_metadata: dict[str, object] | None = None
     # Per-advisory vulnerability details surfaced from risk_assessment.vulnerability_signals
     vulnerability_details: list[dict[str, object]] = Field(default_factory=list)
+    # Lookup outcome for each external source: cve → ok|error|skipped; librariesio → found|not_found|error|skipped
+    lookup_status: dict[str, str] | None = None
 
     model_config = {"from_attributes": True}
 
@@ -123,6 +128,7 @@ class ScanResultMapEntry(BaseModel):
     analyzed_by: list[str] = Field(default_factory=list)
     reputation_metadata: dict[str, object] | None = None
     vulnerability_details: list[dict[str, object]] = Field(default_factory=list)
+    lookup_status: dict[str, str] | None = None
 
     model_config = {"from_attributes": True}
 

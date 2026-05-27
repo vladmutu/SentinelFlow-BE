@@ -150,7 +150,7 @@ class Settings(BaseSettings):
         alias="RISK_SCORING_REPUTATION_WEIGHT",
     )
     risk_scoring_dynamic_weight: float = Field(
-        default=0.0,
+        default=0.2,
         alias="RISK_SCORING_DYNAMIC_WEIGHT",
     )
     risk_scoring_clean_max: float = Field(
