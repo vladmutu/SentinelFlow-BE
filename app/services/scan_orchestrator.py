@@ -473,8 +473,6 @@ async def _scan_single_package(task_id: UUID, scan_mode: str = "full") -> None:
     run_lightweight = scan_mode == "lightweight"
     force_dynamic = scan_mode == "dynamic"
 
-    _scanned_incremented = False
-
     try:
         # ── Phase 1: Static analysis ──────────────────────────────────
         if run_static:
@@ -484,10 +482,6 @@ async def _scan_single_package(task_id: UUID, scan_mode: str = "full") -> None:
                 task.package_version,
                 task.ecosystem,
             )
-            async with AsyncSessionLocal() as _db:
-                await _increment_scanned_once(_db, task.job_id)
-                await _db.commit()
-            _scanned_incremented = True
         else:
             verdict = scanner_service.ScanVerdict(malware_status="unknown", malware_score=None)
 
@@ -592,7 +586,7 @@ async def _scan_single_package(task_id: UUID, scan_mode: str = "full") -> None:
                 task_id,
                 verdict.error_message or "Classifier returned error",
                 risk_assessment=risk_assessment,
-                also_scanned=False,
+                also_scanned=True,
             )
             return
 
@@ -614,11 +608,11 @@ async def _scan_single_package(task_id: UUID, scan_mode: str = "full") -> None:
             reputation_evidence=reputation_result.evidence,
             reputation_metadata=reputation_result.metadata,
         )
-        await _set_task_done(task_id, verdict, risk_assessment=risk_assessment, also_scanned=not run_static)
+        await _set_task_done(task_id, verdict, risk_assessment=risk_assessment, also_scanned=True)
 
     except Exception as exc:
         logger.exception("Task %s failed", task_id)
-        await _set_task_failed(task_id, str(exc), also_scanned=not _scanned_incremented)
+        await _set_task_failed(task_id, str(exc), also_scanned=True)
 
 
 def _derive_verdict_from_dynamic(
