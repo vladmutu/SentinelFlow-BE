@@ -26,16 +26,23 @@ class ScanTriggerRequest(BaseModel):
     )
     scan_mode: str = Field(
         default="full",
-        pattern=r"^(full|static_only|static_classifier|lightweight|lightweight_cve|lightweight_librariesio|dynamic_only)$",
+        pattern=r"^(full|static_enrichment|dynamic|static|lightweight)$",
         description=(
             "Analysis pipeline to run. "
-            "'full': static + CVE/libraries.io (if risky) + dynamic (if still risky). "
-            "'static_only': static + CVE/libraries.io (if risky), no dynamic. "
-            "'static_classifier': static analysis microservice only, no CVE/libraries.io, no dynamic. "
-            "'lightweight': CVE + libraries.io lookup only — no static or dynamic. "
-            "'lightweight_cve': CVE lookup only (OSV + NVD), no libraries.io, no static, no dynamic. "
-            "'lightweight_librariesio': Libraries.io reputation only, no CVE, no static, no dynamic. "
-            "'dynamic_only': unconditional dynamic analysis only."
+            "Graph-tab modes (support deduplication by package source hash): "
+            "'full' cascades static → enrichment (if suspicious/malicious) → dynamic (if still suspicious/malicious). "
+            "'static_enrichment' cascades static → enrichment (if suspicious/malicious), no dynamic. "
+            "'dynamic' runs dynamic analysis on all packages unconditionally. "
+            "Individual-tab modes (always run fresh, no deduplication): "
+            "'static' runs pure static analysis only, no CVE/reputation/dynamic. "
+            "'lightweight' runs CVE + reputation lookup only, no static or dynamic."
+        ),
+    )
+    force_rescan: bool = Field(
+        default=False,
+        description=(
+            "Skip the package-source cache check and always run the full scan pipeline. "
+            "Individual-tab scans should set this to true."
         ),
     )
 
@@ -105,6 +112,7 @@ class ScanTriggerResponse(BaseModel):
     """Returned immediately after accepting a scan request."""
     job_id: UUID
     status: str = "pending"
+    from_cache: bool = False
 
 
 class ScanResultMapEntry(BaseModel):

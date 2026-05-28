@@ -736,12 +736,10 @@ def _build_policy_signals(
 
 _SCAN_MODE_TO_ANALYSIS_MODE: dict[str, str] = {
     "full": "static-classifier",
-    "static_only": "static-classifier",
-    "static_classifier": "static-classifier",
+    "static_enrichment": "static-classifier",
+    "static": "static-classifier",
     "lightweight": "lightweight",
-    "lightweight_cve": "lightweight",
-    "lightweight_librariesio": "lightweight",
-    "dynamic_only": "dynamic_only",
+    "dynamic": "dynamic_only",
 }
 
 
@@ -785,7 +783,7 @@ def build_package_risk_assessment(
         rationale="Thresholded ML classifier output from extracted package features",
         metadata={"scanner_version": verdict.scanner_version},
     )
-    if scan_mode == "static_classifier":
+    if scan_mode == "static":
         structured_static_signals: list[RiskSignal] = []
         static_evidence: list[str] = []
         static_metadata: dict[str, Any] = {"context_markers": {}}

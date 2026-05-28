@@ -2,7 +2,7 @@ import asyncio
 import base64
 import json
 import logging
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -521,8 +521,8 @@ async def get_pypi_dependency_tree(
         timeout = httpx.Timeout(connect=10.0, read=20.0, write=20.0, pool=30.0)
         limits = httpx.Limits(max_connections=20, max_keepalive_connections=10)
         async with httpx.AsyncClient(timeout=timeout, limits=limits) as client:
-            manifest = await manifest_utils.fetch_pypi_manifest(client, owner, repo_name, user_headers)
-            return await _build_pypi_tree_from_manifest(client, manifest)
+            fetched = await manifest_utils.fetch_pypi_manifest(client, owner, repo_name, user_headers)
+            return await _build_pypi_tree_from_manifest(client, fetched.parsed)
 
     except httpx.RequestError as exc:
         raise HTTPException(
@@ -600,7 +600,7 @@ async def add_dependencies_via_pr(
     # Fail-open on scanner errors so a downed scanner never blocks the workflow.
     scan_verdicts = await asyncio.gather(
         *[
-            scanner_service.analyze_package_static(payload.ecosystem, dep.name, dep.version)
+            scanner_service.analyze_package_static(str(uuid4()), dep.name, dep.version, payload.ecosystem)
             for dep in payload.dependencies
         ],
         return_exceptions=True,
@@ -669,7 +669,7 @@ async def add_dependencies_via_pr(
                     repo_name=repo_name,
                     ecosystem=payload.ecosystem,
                     status="pending",
-                    scan_mode="static_dynamic",
+                    scan_mode="full",
                 )
                 db.add(scan_job)
                 await db.commit()
@@ -683,7 +683,7 @@ async def add_dependencies_via_pr(
                         ecosystem=payload.ecosystem,
                         access_token=current_user.access_token,
                         selected_packages=[dep.name for dep in payload.dependencies],
-                        scan_mode="static_dynamic",
+                        scan_mode="full",
                     )
                 )
             except Exception:

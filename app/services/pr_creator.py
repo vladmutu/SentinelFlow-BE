@@ -670,15 +670,19 @@ async def _generate_lockfile_server_side(updated_package_json: str, current_lock
         package_lock_path.write_text(current_lockfile, encoding="utf-8")
 
         def _run_npm_install() -> subprocess.CompletedProcess[str]:
+            import sys
+            # On Windows, .cmd batch files cannot be executed directly by
+            # CreateProcess — they need cmd.exe /c as a wrapper.
+            if sys.platform == "win32" and npm_path.lower().endswith(".cmd"):
+                cmd = ["cmd.exe", "/c", npm_path,
+                       "install", "--package-lock-only",
+                       "--ignore-scripts", "--no-audit", "--no-fund"]
+            else:
+                cmd = [npm_path,
+                       "install", "--package-lock-only",
+                       "--ignore-scripts", "--no-audit", "--no-fund"]
             return subprocess.run(
-                [
-                    npm_path,
-                    "install",
-                    "--package-lock-only",
-                    "--ignore-scripts",
-                    "--no-audit",
-                    "--no-fund",
-                ],
+                cmd,
                 cwd=str(tmp_dir),
                 capture_output=True,
                 text=True,
@@ -700,6 +704,16 @@ async def _generate_lockfile_server_side(updated_package_json: str, current_lock
                     "Server-side lockfile generation is not supported by the current "
                     "Python event loop on this host"
                 ),
+            ) from exc
+        except (FileNotFoundError, PermissionError, OSError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"npm executable could not be started: {exc}",
+            ) from exc
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Unexpected error during lockfile generation: {type(exc).__name__}: {exc}",
             ) from exc
 
         if proc.returncode != 0:

@@ -32,7 +32,7 @@ from app.api.schemas.scan import (
 )
 from app.core.config import settings
 from app.db.session import get_db
-from app.models.scan import ScanJob, ScanResult
+from app.models.scan import RepoPackageSource, ScanJob, ScanResult
 from app.models.user import User
 from app.services.job_runner import job_runner
 from app.services.scan_orchestrator import run_scan_job
@@ -66,7 +66,7 @@ def _to_string_list(value: object) -> list[str]:
 
 def _job_scan_mode(job: ScanJob) -> str:
     sm = getattr(job, "scan_mode", None)
-    return sm if isinstance(sm, str) and sm else "full"
+    return sm if isinstance(sm, str) and sm else "unknown"
 
 
 def _extract_scan_detail_fields(risk_assessment: dict[str, object] | None) -> dict[str, object]:
@@ -296,6 +296,45 @@ async def trigger_scan(
             ),
         )
 
+    # For graph-tab modes: if we already have a stored source hash and a completed
+    # job with that hash, return it immediately without creating a new job.
+    _GRAPH_TAB_MODES = {"full", "static_enrichment", "dynamic"}
+    if body.scan_mode in _GRAPH_TAB_MODES and not body.force_rescan:
+        stored_source_stmt = select(RepoPackageSource).where(
+            RepoPackageSource.owner == owner,
+            RepoPackageSource.repo_name == repo_name,
+            RepoPackageSource.ecosystem == body.ecosystem,
+        )
+        stored_source = (await db.execute(stored_source_stmt)).scalar_one_or_none()
+        if stored_source is not None:
+            cached_job_stmt = (
+                select(ScanJob)
+                .where(
+                    ScanJob.owner == owner,
+                    ScanJob.repo_name == repo_name,
+                    ScanJob.ecosystem == body.ecosystem,
+                    ScanJob.scan_mode == body.scan_mode,
+                    ScanJob.status == "completed",
+                    ScanJob.package_source_hash == stored_source.source_hash,
+                )
+                .order_by(ScanJob.completed_at.desc())
+                .limit(1)
+            )
+            cached_job = (await db.execute(cached_job_stmt)).scalar_one_or_none()
+            if cached_job is not None:
+                logger.info(
+                    "Returning cached scan results for %s/%s (job_id=%s, hash=%s)",
+                    owner,
+                    repo_name,
+                    cached_job.id,
+                    stored_source.source_hash,
+                )
+                return ScanTriggerResponse(
+                    job_id=cached_job.id,
+                    status=cached_job.status,
+                    from_cache=True,
+                )
+
     job = ScanJob(
         owner=owner,
         repo_name=repo_name,
@@ -317,6 +356,7 @@ async def trigger_scan(
             access_token=current_user.access_token,
             selected_packages=body.selected_packages,
             scan_mode=body.scan_mode,
+            force_rescan=body.force_rescan,
         )
     )
 
@@ -442,10 +482,11 @@ async def get_latest_scan_job(
     total_unique = _to_int(job.total_unique_packages, 0) or total_packages
     scanned_raw = _to_int(job.scanned_packages, 0)
     scanned = min(scanned_raw, total_unique) if total_unique > 0 else scanned_raw
+    processed = _to_int(job.processed_packages, 0)
 
     progress_percent = 0.0
     if total_unique > 0:
-        progress_percent = min(100.0, max(0.0, (scanned / total_unique) * 100.0))
+        progress_percent = min(100.0, max(0.0, (processed / total_unique) * 100.0))
 
     elapsed_seconds: int | None = None
     packages_per_minute: float | None = None
@@ -558,6 +599,16 @@ async def get_scan_history(
     repo_name: str,
     page: int = Query(default=1, ge=1, description="Page number (1-based)"),
     per_page: int = Query(default=20, ge=1, le=100, description="Results per page"),
+    scan_mode: str | None = Query(
+        default=None,
+        pattern=r"^(full|static_enrichment|dynamic|static|lightweight)$",
+        description="Optional scan mode filter",
+    ),
+    status: str | None = Query(
+        default=None,
+        pattern=r"^(pending|running|completed|failed|cancelled)$",
+        description="Optional scan status filter",
+    ),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> ScanHistoryResponse:
@@ -569,6 +620,10 @@ async def get_scan_history(
     """
     offset = (page - 1) * per_page
     base_filter = and_(ScanJob.owner == owner, ScanJob.repo_name == repo_name)
+    if scan_mode:
+        base_filter = and_(base_filter, ScanJob.scan_mode == scan_mode)
+    if status:
+        base_filter = and_(base_filter, ScanJob.status == status)
 
     total = (
         await db.execute(select(func.count()).select_from(ScanJob).where(base_filter))
@@ -754,10 +809,11 @@ async def get_scan_job(
     total_unique = _to_int(job.total_unique_packages, 0) or total_packages
     scanned_raw = _to_int(job.scanned_packages, 0)
     scanned = min(scanned_raw, total_unique) if total_unique > 0 else scanned_raw
+    processed = _to_int(job.processed_packages, 0)
 
     progress_percent = 0.0
     if total_unique > 0:
-        progress_percent = min(100.0, max(0.0, (scanned / total_unique) * 100.0))
+        progress_percent = min(100.0, max(0.0, (processed / total_unique) * 100.0))
 
     elapsed_seconds: int | None = None
     packages_per_minute: float | None = None

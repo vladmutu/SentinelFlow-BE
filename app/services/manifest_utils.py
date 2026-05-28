@@ -51,6 +51,19 @@ _PYPI_SPEC_TOKEN_RE = re.compile(r"(==|!=|~=|>=|<=|>|<)\s*([^,\s;]+)")
 
 
 @dataclass(frozen=True)
+class FetchedManifest:
+    """Raw file content + parsed dict returned by manifest fetch functions.
+
+    ``raw_content`` is the original file text used to compute the SHA-256
+    source hash for scan deduplication.  ``parsed`` is the dict previously
+    returned by the fetch functions — pass it to tree-resolution helpers.
+    """
+    parsed: dict
+    raw_content: str
+    source_type: str  # e.g. "package.json", "package-lock.json", "requirements.txt"
+
+
+@dataclass(frozen=True)
 class NpmScanWorkload:
     """Precomputed npm workload used by scan orchestration.
 
@@ -426,10 +439,11 @@ async def fetch_npm_manifest(
     owner: str,
     repo: str,
     headers: dict[str, str],
-) -> dict:
+) -> FetchedManifest:
     """Fetch ``package-lock.json`` (preferred) or ``package.json`` from GitHub.
 
-    Returns the parsed JSON dict.  Raises HTTPException on failure.
+    Returns a FetchedManifest with the raw content string and parsed dict.
+    Raises HTTPException on failure.
     """
     lockfile_resp = await client.get(
         f"https://api.github.com/repos/{owner}/{repo}/contents/package-lock.json",
@@ -452,7 +466,7 @@ async def fetch_npm_manifest(
                 detail=f"GitHub API error while fetching package.json: {pkg_resp.status_code}",
             )
         content = decode_github_content(pkg_resp.json())
-        return json.loads(content)
+        return FetchedManifest(parsed=json.loads(content), raw_content=content, source_type="package.json")
 
     if lockfile_resp.is_error:
         raise HTTPException(
@@ -461,7 +475,7 @@ async def fetch_npm_manifest(
         )
 
     content = decode_github_content(lockfile_resp.json())
-    return json.loads(content)
+    return FetchedManifest(parsed=json.loads(content), raw_content=content, source_type="package-lock.json")
 
 
 async def fetch_pypi_manifest(
@@ -469,10 +483,11 @@ async def fetch_pypi_manifest(
     owner: str,
     repo: str,
     headers: dict[str, str],
-) -> dict:
-    """Fetch ``requirements.txt`` from GitHub and return a synthetic manifest.
+) -> FetchedManifest:
+    """Fetch ``requirements.txt`` from GitHub and return a FetchedManifest.
 
-    Returns ``{"dependencies": {"pkg": "version", …}}``.
+    ``parsed`` is the synthetic ``{"dependencies": {"pkg": "version", …}}`` dict.
+    ``raw_content`` is the original requirements.txt text used for source hashing.
     """
     resp = await client.get(
         f"https://api.github.com/repos/{owner}/{repo}/contents/requirements.txt",
@@ -499,7 +514,11 @@ async def fetch_pypi_manifest(
         if not pkg:
             continue
         deps[pkg] = spec or "latest"
-    return {"dependencies": deps}
+    return FetchedManifest(
+        parsed={"dependencies": deps},
+        raw_content=content,
+        source_type="requirements.txt",
+    )
 
 
 # ── Tree flattening ───────────────────────────────────────────────────

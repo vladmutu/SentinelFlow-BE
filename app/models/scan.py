@@ -19,7 +19,7 @@ class ScanJob(Base):
     owner: Mapped[str] = mapped_column(String(255), nullable=False)
     repo_name: Mapped[str] = mapped_column(String(255), nullable=False)
     ecosystem: Mapped[str] = mapped_column(String(50), nullable=False)  # "npm" | "pypi"
-    scan_mode: Mapped[str] = mapped_column(String(50), nullable=False, server_default="full")  # full | static_only | static_dynamic | dynamic_only
+    scan_mode: Mapped[str] = mapped_column(String(50), nullable=False, server_default="full")  # full | static_enrichment | dynamic | static | lightweight
     status: Mapped[str] = mapped_column(
         String(50), nullable=False, default="pending",
     )  # pending → running → completed | failed
@@ -28,6 +28,7 @@ class ScanJob(Base):
     scanned_packages: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     total_dependency_nodes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     total_unique_packages: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    package_source_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -133,4 +134,33 @@ class ScanTask(Base):
         Index("ix_scan_tasks_job_id", "job_id"),
         Index("ix_scan_tasks_status", "status"),
         Index("ix_scan_tasks_package", "package_name", "package_version", "ecosystem"),
+    )
+
+
+class RepoPackageSource(Base):
+    """Persists the raw package source file (package.json, requirements.txt, etc.)
+    and a SHA-256 hash per repo+ecosystem. Used to skip scans when the source hasn't changed."""
+
+    __tablename__ = "repo_package_sources"
+
+    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
+    owner: Mapped[str] = mapped_column(String(255), nullable=False)
+    repo_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    ecosystem: Mapped[str] = mapped_column(String(50), nullable=False)
+    source_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    source_content: Mapped[str] = mapped_column(Text, nullable=False)
+    source_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        Index("ix_repo_package_sources_repo", "owner", "repo_name", "ecosystem", unique=True),
     )

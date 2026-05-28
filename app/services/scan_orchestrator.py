@@ -1,13 +1,25 @@
-"""Task-based background scan orchestration.
+"""Background scan orchestration.
 
-`run_scan_job` is intentionally lightweight. It only discovers package work,
-persists one `ScanTask` row per package, and enqueues each task to workers.
-Per-package execution and state transitions happen in `_scan_single_package`.
+``run_scan_job`` discovers package work, persists one ``ScanTask`` row per
+package, and enqueues each task to workers.  Per-package execution and state
+transitions happen in ``_scan_single_package``.
+
+Scan modes
+----------
+Graph-tab modes (support source-hash deduplication):
+  full              static → enrichment (if suspicious/malicious) → dynamic (if still risky)
+  static_enrichment static → enrichment (if suspicious/malicious)
+  dynamic           dynamic analysis for all packages unconditionally
+
+Individual-tab modes (always run fresh, no deduplication):
+  static            pure static analysis only
+  lightweight       CVE + reputation lookup only
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 from datetime import datetime, timezone
 from uuid import UUID
@@ -18,7 +30,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.db.session import AsyncSessionLocal
-from app.models.scan import ScanJob, ScanResult, ScanTask
+from app.models.scan import RepoPackageSource, ScanJob, ScanResult, ScanTask
 from app.services import (
     dynamic_analysis_service,
     manifest_utils,
@@ -34,6 +46,9 @@ _TASK_DONE = "done"
 _TASK_FAILED = "failed"
 _TASK_TERMINAL_STATES = {_TASK_DONE, _TASK_FAILED}
 
+# Modes that support source-hash deduplication (triggered from the Dependency Graph tab).
+GRAPH_TAB_MODES = {"full", "static_enrichment", "dynamic"}
+
 _scan_task_queue: asyncio.Queue[tuple[UUID, str]] | None = None
 _scan_worker_tasks: list[asyncio.Task] = []
 _scan_worker_lock = asyncio.Lock()
@@ -47,8 +62,14 @@ async def run_scan_job(
     access_token: str,
     selected_packages: list[str] | None = None,
     scan_mode: str = "full",
+    force_rescan: bool = False,
 ) -> None:
-    """Create DB-backed package tasks and enqueue them for worker execution."""
+    """Create DB-backed package tasks and enqueue them for worker execution.
+
+    For graph-tab modes (full, static_enrichment, dynamic) and when
+    ``force_rescan`` is False, the job is short-circuited to "completed" if a
+    previous completed scan exists with an identical package source hash.
+    """
     async with AsyncSessionLocal() as db:
         try:
             await _set_job_status(db, job_id, "running", started_at=datetime.now(timezone.utc), scan_mode=scan_mode)
@@ -59,20 +80,20 @@ async def run_scan_job(
                 "X-GitHub-Api-Version": "2022-11-28",
             }
 
-            _DEP_RESOLVE_TIMEOUT = 90  # seconds
+            _DEP_RESOLVE_TIMEOUT = 90
             try:
                 async with asyncio.timeout(_DEP_RESOLVE_TIMEOUT):
                     async with httpx.AsyncClient(timeout=30.0) as client:
                         if ecosystem == "npm":
-                            manifest = await manifest_utils.fetch_npm_manifest(client, owner, repo, headers)
-                            tree = await manifest_utils.resolve_npm_dependency_tree(client, manifest)
-                            workload = manifest_utils.build_npm_scan_workload(manifest, tree)
+                            fetched = await manifest_utils.fetch_npm_manifest(client, owner, repo, headers)
+                            tree = await manifest_utils.resolve_npm_dependency_tree(client, fetched.parsed)
+                            workload = manifest_utils.build_npm_scan_workload(fetched.parsed, tree)
                             packages = workload.refs
                             total_dependency_nodes = workload.total_dependency_nodes
                             total_unique_packages = workload.unique_packages
                         elif ecosystem == "pypi":
-                            manifest = await manifest_utils.fetch_pypi_manifest(client, owner, repo, headers)
-                            tree = await manifest_utils.build_pypi_dependency_tree_deep(client, manifest)
+                            fetched = await manifest_utils.fetch_pypi_manifest(client, owner, repo, headers)
+                            tree = await manifest_utils.build_pypi_dependency_tree_deep(client, fetched.parsed)
                             packages = manifest_utils.flatten_dependencies(tree)
                             total_dependency_nodes = manifest_utils.count_dependency_nodes(tree)
                             total_unique_packages = len(packages)
@@ -92,6 +113,33 @@ async def run_scan_job(
                     completed_at=datetime.now(timezone.utc),
                 )
                 return
+
+            # Compute source hash for deduplication.
+            source_hash = hashlib.sha256(fetched.raw_content.encode("utf-8")).hexdigest()
+
+            # For graph-tab modes: check if a completed job with the same source hash exists.
+            if scan_mode in GRAPH_TAB_MODES and not force_rescan:
+                cached_job = await _find_completed_job_for_hash(db, owner, repo, ecosystem, source_hash, scan_mode)
+                if cached_job is not None:
+                    logger.info(
+                        "Scan job %s: source unchanged (hash=%s), reusing results from job %s",
+                        job_id,
+                        source_hash,
+                        cached_job.id,
+                    )
+                    await _set_package_source_hash(db, job_id, source_hash)
+                    await _set_job_status(
+                        db,
+                        job_id,
+                        "completed",
+                        completed_at=datetime.now(timezone.utc),
+                    )
+                    return
+
+            # Persist updated package source and record hash on this job.
+            await _upsert_package_source(db, owner, repo, ecosystem, fetched, source_hash)
+            await _set_package_source_hash(db, job_id, source_hash)
+            await db.commit()
 
             packages = _filter_selected_packages(packages, selected_packages)
             total_unique_packages = len(packages)
@@ -120,7 +168,6 @@ async def run_scan_job(
                 total_unique_packages=total_unique_packages,
             )
 
-            # Create ScanTask records first so we have task.id UUIDs to pass to the coordinator.
             tasks = [
                 ScanTask(
                     job_id=job_id,
@@ -152,6 +199,86 @@ async def run_scan_job(
                 logger.exception("Could not mark job %s as failed", job_id)
 
 
+# ── Package source helpers ─────────────────────────────────────────────
+
+async def _get_stored_source(
+    db: AsyncSession,
+    owner: str,
+    repo_name: str,
+    ecosystem: str,
+) -> RepoPackageSource | None:
+    stmt = select(RepoPackageSource).where(
+        RepoPackageSource.owner == owner,
+        RepoPackageSource.repo_name == repo_name,
+        RepoPackageSource.ecosystem == ecosystem,
+    )
+    return (await db.execute(stmt)).scalar_one_or_none()
+
+
+async def _upsert_package_source(
+    db: AsyncSession,
+    owner: str,
+    repo_name: str,
+    ecosystem: str,
+    fetched: manifest_utils.FetchedManifest,
+    source_hash: str,
+) -> None:
+    existing = await _get_stored_source(db, owner, repo_name, ecosystem)
+    now = datetime.now(timezone.utc)
+    if existing is None:
+        db.add(
+            RepoPackageSource(
+                owner=owner,
+                repo_name=repo_name,
+                ecosystem=ecosystem,
+                source_type=fetched.source_type,
+                source_content=fetched.raw_content,
+                source_hash=source_hash,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+    else:
+        existing.source_type = fetched.source_type
+        existing.source_content = fetched.raw_content
+        existing.source_hash = source_hash
+        existing.updated_at = now
+
+
+async def _find_completed_job_for_hash(
+    db: AsyncSession,
+    owner: str,
+    repo_name: str,
+    ecosystem: str,
+    source_hash: str,
+    scan_mode: str,
+) -> ScanJob | None:
+    stmt = (
+        select(ScanJob)
+        .where(
+            ScanJob.owner == owner,
+            ScanJob.repo_name == repo_name,
+            ScanJob.ecosystem == ecosystem,
+            ScanJob.scan_mode == scan_mode,
+            ScanJob.status == "completed",
+            ScanJob.package_source_hash == source_hash,
+        )
+        .order_by(ScanJob.completed_at.desc())
+        .limit(1)
+    )
+    return (await db.execute(stmt)).scalar_one_or_none()
+
+
+async def _set_package_source_hash(db: AsyncSession, job_id: UUID, source_hash: str) -> None:
+    stmt = select(ScanJob).where(ScanJob.id == job_id)
+    row = (await db.execute(stmt)).scalar_one_or_none()
+    if row is not None:
+        row.package_source_hash = source_hash
+    await db.commit()
+
+
+# ── Package filtering ──────────────────────────────────────────────────
+
 def _filter_selected_packages(
     packages: list[manifest_utils.PackageRef],
     selected_packages: list[str] | None,
@@ -172,7 +299,6 @@ def _filter_selected_packages(
         if not token:
             continue
 
-        # Parse as exact name@version using the last '@' to support scoped npm names.
         last_at = token.rfind("@")
         if last_at > 0 and last_at < len(token) - 1:
             pkg_name = token[:last_at].strip().lower()
@@ -196,6 +322,8 @@ def _filter_selected_packages(
     return filtered
 
 
+# ── Worker pool ────────────────────────────────────────────────────────
+
 async def enqueue_scan_task(task_id: UUID, scan_mode: str = "full") -> None:
     """Enqueue a single package task for asynchronous worker processing."""
     await _ensure_scan_workers_started()
@@ -210,7 +338,6 @@ async def _ensure_scan_workers_started() -> None:
         if _scan_task_queue is None:
             _scan_task_queue = asyncio.Queue()
 
-        # Remove dead (cancelled / errored) workers so new ones can be spawned.
         alive = [t for t in _scan_worker_tasks if not t.done()]
         _scan_worker_tasks.clear()
         _scan_worker_tasks.extend(alive)
@@ -225,12 +352,10 @@ async def _scan_task_worker(worker_index: int) -> None:
     assert _scan_task_queue is not None
 
     while True:
-        # Separate the get() from the processing so we never call task_done()
-        # for an item we never actually received (e.g. CancelledError during get).
         try:
             task_id, scan_mode = await _scan_task_queue.get()
         except asyncio.CancelledError:
-            raise  # Worker is being shut down — do not call task_done()
+            raise
 
         try:
             await _scan_single_package(task_id, scan_mode)
@@ -240,14 +365,19 @@ async def _scan_task_worker(worker_index: int) -> None:
             _scan_task_queue.task_done()
 
 
-async def _scan_single_package(task_id: UUID, scan_mode: str = "full") -> None:
-    """Execute one package task by id with explicit status transitions.
+# ── Per-package pipeline ───────────────────────────────────────────────
 
-    scan_mode controls which analysis phases run:
-      full            — static + vulnerability (OSV/NVD) + dynamic (if malicious) + reputation
-      static_only     — static analysis only
-      static_dynamic  — static + dynamic (if malicious); no vulnerability / reputation
-      dynamic_only    — unconditional dynamic analysis; no static / vulnerability / reputation
+async def _scan_single_package(task_id: UUID, scan_mode: str = "full") -> None:
+    """Execute one package task with the pipeline defined by ``scan_mode``.
+
+    Modes
+    -----
+    full              static → enrichment (CVE+rep, if suspicious/malicious)
+                      → dynamic (if still suspicious/malicious)
+    static_enrichment static → enrichment (CVE+rep, if suspicious/malicious)
+    dynamic           dynamic analysis unconditionally
+    static            pure static analysis; no CVE, reputation, or dynamic
+    lightweight       CVE + reputation lookup unconditionally; no static or dynamic
     """
     task = await _load_task(task_id)
     if task is None:
@@ -258,7 +388,7 @@ async def _scan_single_package(task_id: UUID, scan_mode: str = "full") -> None:
         return
 
     if task.status not in {_TASK_PENDING, _TASK_FAILED}:
-        logger.info("Task %s already in-flight with status=%s; skipping duplicate", task_id, task.status)
+        logger.info("Task %s already in-flight with status=%s; skipping", task_id, task.status)
         return
 
     if await _is_job_cancelled(task.job_id):
@@ -266,27 +396,16 @@ async def _scan_single_package(task_id: UUID, scan_mode: str = "full") -> None:
         await _set_task_status(task_id, _TASK_DONE)
         return
 
-    # Phase flags derived from scan_mode
-    # full                  → static → CVE+libraries.io (if risky) → dynamic (if still risky)
-    # static_only           → static → CVE+libraries.io (if risky); no dynamic
-    # static_classifier     → static only; no CVE / libraries.io / dynamic
-    # lightweight           → CVE + libraries.io for all packages; no static, no dynamic
-    # lightweight_cve       → CVE lookup only (OSV+NVD); no libraries.io, no static, no dynamic
-    # lightweight_librariesio → Libraries.io only; no CVE, no static, no dynamic
-    # dynamic_only          → dynamic only; no static, no CVE, no libraries.io
-    STATIC_RISK_ENRICHMENT_THRESHOLD = 0.5
-
-    run_static    = scan_mode in {"full", "static_only", "static_classifier"}
-    run_static_enrichment = scan_mode in {"full", "static_only"}
-    force_dynamic = scan_mode == "dynamic_only"
-    run_lightweight = scan_mode in {"lightweight", "lightweight_cve", "lightweight_librariesio"}
-    run_lightweight_cve = scan_mode in {"lightweight", "lightweight_cve"}
-    run_lightweight_rep = scan_mode in {"lightweight", "lightweight_librariesio"}
+    # Derive execution flags from scan_mode.
+    run_static = scan_mode in {"full", "static_enrichment", "static"}
+    run_conditional_enrichment = scan_mode in {"full", "static_enrichment"}
+    run_lightweight = scan_mode == "lightweight"
+    force_dynamic = scan_mode == "dynamic"
 
     _scanned_incremented = False
 
     try:
-        # ── Step 1: Static analysis ──────────────────────────────────────────
+        # ── Phase 1: Static analysis ──────────────────────────────────
         if run_static:
             verdict = await scanner_service.analyze_package_static(
                 str(task.id),
@@ -294,8 +413,6 @@ async def _scan_single_package(task_id: UUID, scan_mode: str = "full") -> None:
                 task.package_version,
                 task.ecosystem,
             )
-            # Increment scanned counter right after static so the UI shows
-            # per-package progress without waiting for CVE/dynamic to finish.
             async with AsyncSessionLocal() as _db:
                 await _increment_scanned_once(_db, task.job_id)
                 await _db.commit()
@@ -307,26 +424,19 @@ async def _scan_single_package(task_id: UUID, scan_mode: str = "full") -> None:
         dep_ctx = dependency_context if isinstance(dependency_context, dict) else {}
         is_direct_dep = bool(dep_ctx.get("is_direct_dependency", False))
 
-        # ── Step 2: Determine enrichment need ───────────────────────────────
-        # lightweight modes: always enrich all packages; full: always enrich all packages;
-        # static_only: only if risky.
-        static_is_risky = (
-            verdict.malware_status == "malicious"
-            or (verdict.malware_score is not None and verdict.malware_score > STATIC_RISK_ENRICHMENT_THRESHOLD)
+        # ── Phase 2: Determine CVE / reputation enrichment need ───────
+        # Enrich when static result is suspicious or malicious (score > clean threshold).
+        static_needs_enrichment = (
+            verdict.malware_status in {"malicious", "suspicious"}
+            or (
+                verdict.malware_score is not None
+                and verdict.malware_score > settings.risk_scoring_clean_max
+            )
         )
-        run_full_enrichment = scan_mode == "full"
-        should_enrich_cve = run_full_enrichment or run_lightweight_cve or (run_static_enrichment and static_is_risky)
-        should_enrich_rep = run_full_enrichment or run_lightweight_rep or (run_static_enrichment and static_is_risky)
+        should_enrich_cve = run_lightweight or (run_conditional_enrichment and static_needs_enrichment)
+        should_enrich_rep = run_lightweight or (run_conditional_enrichment and static_needs_enrichment)
 
-        # Explicitly ensure `static_classifier` (triggered from the static-analysis
-        # tab) never performs any lightweight enrichment. This makes the intent
-        # explicit and protects against any future logic paths that might use
-        # `run_static` instead of `run_static_enrichment`.
-        if scan_mode == "static_classifier":
-            should_enrich_cve = False
-            should_enrich_rep = False
-
-        # ── Step 3: CVE lookup (OSV/NVD) ─────────────────────────────────────
+        # ── Phase 3: CVE lookup (OSV / NVD) ──────────────────────────
         if should_enrich_cve:
             vulnerability_result = await vulnerability_service.lookup_package_vulnerabilities(
                 task.ecosystem,
@@ -338,7 +448,7 @@ async def _scan_single_package(task_id: UUID, scan_mode: str = "full") -> None:
                 signals=[], advisory_references=[], evidence=[], metadata={"skipped": True}
             )
 
-        # ── Step 4: Libraries.io / reputation ────────────────────────────────
+        # ── Phase 4: Reputation lookup (npm registry / Libraries.io) ─
         if should_enrich_rep:
             has_cves = len(vulnerability_result.signals) > 0
             try:
@@ -347,7 +457,7 @@ async def _scan_single_package(task_id: UUID, scan_mode: str = "full") -> None:
                     task.package_name,
                     task.package_version,
                     is_direct_dependency=is_direct_dep,
-                    force_librariesio=run_lightweight_rep or is_direct_dep or has_cves or (run_static_enrichment and static_is_risky),
+                    force_librariesio=run_lightweight or is_direct_dep or has_cves,
                 )
             except Exception:
                 logger.warning(
@@ -363,9 +473,12 @@ async def _scan_single_package(task_id: UUID, scan_mode: str = "full") -> None:
                 signals=[], evidence=[], metadata={"skipped": True}
             )
 
-        # ── Step 5: Dynamic analysis (full mode only, if still risky) ────────
+        # ── Phase 5: Dynamic analysis ─────────────────────────────────
+        # Runs unconditionally for "dynamic" mode; for "full" mode runs only
+        # if the package is still suspicious/malicious after enrichment.
         run_dynamic = force_dynamic or (
-            scan_mode == "full" and _should_run_dynamic_analysis(verdict, reputation_result, vulnerability_result)
+            scan_mode == "full"
+            and _should_run_dynamic_analysis(verdict, reputation_result, vulnerability_result)
         )
         if run_dynamic:
             dynamic_result = await dynamic_analysis_service.analyze_package_dynamically(
@@ -374,19 +487,17 @@ async def _scan_single_package(task_id: UUID, scan_mode: str = "full") -> None:
                 task.package_version,
             )
         else:
-            skip_reason = (
-                "mode_excluded" if scan_mode in {"static_only", "static_classifier", "lightweight", "lightweight_cve", "lightweight_librariesio"}
-                else "not_malicious"
-            )
+            skip_reason = "mode_excluded" if scan_mode not in {"full", "dynamic"} else "not_risky"
             dynamic_result = dynamic_analysis_service.build_skipped_dynamic_result(
                 skip_reason,
                 detail=f"scan_mode={scan_mode}, static_verdict={verdict.malware_status}",
             )
 
-        # For dynamic_only: derive verdict from dynamic findings (no static verdict available)
+        # For "dynamic" mode: derive a verdict from dynamic findings (no static ran).
         if force_dynamic and not run_static:
             verdict = _derive_verdict_from_dynamic(dynamic_result)
 
+        # ── Phase 6: Build risk assessment and persist ─────────────────
         if run_static and verdict.malware_status == "error":
             risk_assessment = scanner_service.build_package_risk_assessment(
                 task.package_name,
@@ -410,7 +521,7 @@ async def _scan_single_package(task_id: UUID, scan_mode: str = "full") -> None:
                 task_id,
                 verdict.error_message or "Classifier returned error",
                 risk_assessment=risk_assessment,
-                also_scanned=False,  # scanned_packages already incremented after static
+                also_scanned=False,
             )
             return
 
@@ -442,7 +553,7 @@ async def _scan_single_package(task_id: UUID, scan_mode: str = "full") -> None:
 def _derive_verdict_from_dynamic(
     dynamic_result: dynamic_analysis_service.DynamicAnalysisResult,
 ) -> scanner_service.ScanVerdict:
-    """Map dynamic analysis signals to a ScanVerdict for dynamic_only scans."""
+    """Map dynamic analysis signals to a ScanVerdict for dynamic-mode scans."""
     metadata = dynamic_result.metadata
     status = str(metadata.get("status", "unknown"))
 
@@ -485,8 +596,6 @@ def _should_run_dynamic_analysis(
 
     has_cves = vulnerability_result is not None and len(vulnerability_result.signals) > 0
 
-    # Run dynamic if the static classifier explicitly flagged the package, if the
-    # continuous score is near the malicious boundary, or if known CVEs exist.
     flagged = (
         verdict.malware_status == "malicious"
         or (verdict.malware_score is not None and verdict.malware_score >= settings.dynamic_analysis_priority_threshold)
@@ -495,8 +604,6 @@ def _should_run_dynamic_analysis(
     if not flagged:
         return False
 
-    # Skip dynamic if the package has strong reputation AND no CVEs — the
-    # reputation_override policy will suppress the score to clean anyway.
     if reputation_result is not None:
         trust = reputation_result.metadata.get("trust_score", 0.0)
         if isinstance(trust, float) and trust >= 0.8 and not has_cves:
@@ -507,6 +614,7 @@ def _should_run_dynamic_analysis(
     return True
 
 
+# ── Result extraction helpers ──────────────────────────────────────────
 
 def _extract_result_risk_fields(risk_assessment: object | None) -> dict[str, object]:
     payload = _serialize_risk_assessment(risk_assessment)
@@ -544,16 +652,15 @@ def _extract_result_risk_fields(risk_assessment: object | None) -> dict[str, obj
     }
 
 
+# ── DB persistence helpers ─────────────────────────────────────────────
+
 async def _is_job_cancelled(job_id: UUID) -> bool:
-    """Return whether a scan job is currently marked as cancelled."""
     async with AsyncSessionLocal() as db:
         stmt = select(ScanJob.status).where(ScanJob.id == job_id)
         result = await db.execute(stmt)
         status_value = result.scalar_one_or_none()
         return status_value == "cancelled"
 
-
-# -- persistence helpers ------------------------------------------------
 
 async def _load_task(task_id: UUID) -> ScanTask | None:
     async with AsyncSessionLocal() as db:
@@ -567,7 +674,6 @@ async def _set_task_status(task_id: UUID, status: str) -> None:
         task = (await db.execute(stmt)).scalar_one_or_none()
         if task is None:
             return
-
         now = datetime.now(timezone.utc)
         task.status = status
         task.updated_at = now
@@ -638,11 +744,9 @@ async def _set_task_failed(
 def _derive_malware_status(task: ScanTask, risk_assessment: object | None) -> str:
     """Derive the effective malware_status for a scan result.
 
-    When no classifier ran (lightweight / dynamic_only mode) the task verdict is
-    "unknown". In that case we promote the status to the risk assessment's
-    overall_status so that the column reflects actual CVE/reputation findings
-    rather than always being "unknown".
-    "suspicious" maps to "malicious" because the column only stores four values.
+    When no classifier ran (lightweight / dynamic mode) the task verdict is
+    "unknown".  In that case promote to the risk assessment's overall_status
+    so the column reflects actual CVE/reputation/dynamic findings.
     """
     base = task.malware_status or "unknown"
     if base != "unknown":

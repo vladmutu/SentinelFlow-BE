@@ -134,27 +134,27 @@ class Settings(BaseSettings):
 
     # Unified risk scoring controls
     risk_scoring_classifier_weight: float = Field(
-        default=0.5,
+        default=0.40,
         alias="RISK_SCORING_CLASSIFIER_WEIGHT",
     )
     risk_scoring_static_weight: float = Field(
-        default=0.2,
+        default=0.15,
         alias="RISK_SCORING_STATIC_WEIGHT",
     )
     risk_scoring_vulnerability_weight: float = Field(
-        default=0.25,
+        default=0.30,
         alias="RISK_SCORING_VULNERABILITY_WEIGHT",
     )
     risk_scoring_reputation_weight: float = Field(
-        default=0.05,
+        default=0.10,
         alias="RISK_SCORING_REPUTATION_WEIGHT",
     )
     risk_scoring_dynamic_weight: float = Field(
-        default=0.2,
+        default=0.45,
         alias="RISK_SCORING_DYNAMIC_WEIGHT",
     )
     risk_scoring_clean_max: float = Field(
-        default=0.34,
+        default=0.40,
         alias="RISK_SCORING_CLEAN_MAX",
     )
     risk_scoring_suspicious_max: float = Field(

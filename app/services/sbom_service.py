@@ -168,19 +168,31 @@ async def _get_latest_scan_results(
     owner: str,
     repo_name: str,
 ) -> dict[str, ScanResult]:
-    """Load the latest completed scan results keyed by name@version."""
+    """Load the latest completed scan results keyed by name@version.
+
+    Prefers graph-tab scan modes (full, static_enrichment, dynamic) which carry
+    composite risk scores. Falls back to any completed scan if none exists.
+    """
+    _PREFERRED_MODES = ("full", "static_enrichment", "dynamic")
     async with AsyncSessionLocal() as db:
-        job_stmt = (
-            select(ScanJob)
-            .where(
+        for modes in (_PREFERRED_MODES, None):
+            filters = [
                 ScanJob.owner == owner,
                 ScanJob.repo_name == repo_name,
                 ScanJob.status == "completed",
+            ]
+            if modes is not None:
+                filters.append(ScanJob.scan_mode.in_(modes))
+            job_stmt = (
+                select(ScanJob)
+                .where(*filters)
+                .order_by(ScanJob.completed_at.desc())
+                .limit(1)
             )
-            .order_by(ScanJob.completed_at.desc())
-            .limit(1)
-        )
-        job = (await db.execute(job_stmt)).scalar_one_or_none()
+            job = (await db.execute(job_stmt)).scalar_one_or_none()
+            if job is not None:
+                break
+
         if job is None:
             return {}
 
@@ -256,11 +268,11 @@ async def generate_sbom(
     timeout = httpx.Timeout(connect=10.0, read=20.0, write=20.0, pool=30.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
         if ecosystem == "npm":
-            manifest = await manifest_utils.fetch_npm_manifest(client, owner, repo, headers)
-            tree = await manifest_utils.resolve_npm_dependency_tree(client, manifest)
+            fetched = await manifest_utils.fetch_npm_manifest(client, owner, repo, headers)
+            tree = await manifest_utils.resolve_npm_dependency_tree(client, fetched.parsed)
         else:
-            manifest = await manifest_utils.fetch_pypi_manifest(client, owner, repo, headers)
-            tree = await manifest_utils.build_pypi_dependency_tree_deep(client, manifest)
+            fetched = await manifest_utils.fetch_pypi_manifest(client, owner, repo, headers)
+            tree = await manifest_utils.build_pypi_dependency_tree_deep(client, fetched.parsed)
 
     # Flatten to unique packages
     refs = manifest_utils.flatten_dependencies(tree)
@@ -299,8 +311,15 @@ async def generate_sbom(
         vulnerabilities: list[SbomVulnerability] = []
 
         if scan_result is not None:
-            risk_status = scan_result.malware_status
-            risk_score = scan_result.malware_score
+            ra = scan_result.risk_assessment if isinstance(scan_result.risk_assessment, dict) else {}
+            risk_overall_status = ra.get("overall_status")
+            risk_overall_score = ra.get("overall_score")
+            risk_status = risk_overall_status or scan_result.malware_status
+            risk_score = (
+                risk_overall_score
+                if risk_overall_score is not None
+                else scan_result.malware_score
+            )
             if isinstance(scan_result.risk_assessment, dict):
                 vulnerabilities = _extract_vulnerabilities_from_risk_assessment(
                     scan_result.risk_assessment
