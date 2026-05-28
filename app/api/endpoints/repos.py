@@ -216,6 +216,7 @@ async def _get_installation_token_for_repo(client: httpx.AsyncClient, owner: str
         "X-GitHub-Api-Version": "2022-11-28",
     }
 
+    logger.info("GitHub → GET /repos/%s/%s/installation", owner, repo_name)
     installation_resp = await client.get(
         f"https://api.github.com/repos/{owner}/{repo_name}/installation",
         headers=app_headers,
@@ -238,6 +239,7 @@ async def _get_installation_token_for_repo(client: httpx.AsyncClient, owner: str
             detail="GitHub installation response missing id",
         )
 
+    logger.info("GitHub → POST /app/installations/%s/access_tokens", installation_id)
     token_resp = await client.post(
         f"https://api.github.com/app/installations/{installation_id}/access_tokens",
         headers=app_headers,
@@ -255,6 +257,7 @@ async def _get_installation_token_for_repo(client: httpx.AsyncClient, owner: str
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="GitHub installation token was not returned",
         )
+    logger.debug("Installation token obtained for %s/%s (installation_id=%s)", owner, repo_name, installation_id)
     return installation_token
 
 
@@ -284,6 +287,7 @@ async def list_repositories(current_user: User = Depends(get_current_user)) -> l
 
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
+            logger.info("GitHub → GET /user/installations  user=%s", current_user.username)
             installations_resp = await client.get(
                 "https://api.github.com/user/installations",
                 headers=headers,
@@ -308,6 +312,7 @@ async def list_repositories(current_user: User = Depends(get_current_user)) -> l
             installations_payload = installations_resp.json()
             installations = installations_payload.get("installations", [])
             installation_ids = [item.get("id") for item in installations if item.get("id") is not None]
+            logger.debug("GitHub installations for %s: %d found", current_user.username, len(installation_ids))
 
             all_repositories: list[dict] = []
             for installation_id in installation_ids:
@@ -315,6 +320,7 @@ async def list_repositories(current_user: User = Depends(get_current_user)) -> l
                     "https://api.github.com/user/installations/"
                     f"{installation_id}/repositories"
                 )
+                logger.debug("GitHub → GET /user/installations/%s/repositories", installation_id)
                 repos_resp = await client.get(repos_url, headers=headers, params=repo_params)
 
                 if repos_resp.status_code == status.HTTP_401_UNAUTHORIZED:
@@ -348,6 +354,11 @@ async def list_repositories(current_user: User = Depends(get_current_user)) -> l
             if isinstance(repo_id, int):
                 unique_by_id[repo_id] = repo
 
+        logger.info(
+            "List repositories → FE: user=%s total_unique=%d",
+            current_user.username,
+            len(unique_by_id),
+        )
         return [
             {
                 "id": repo.get("id"),
@@ -414,6 +425,7 @@ async def get_npm_dependency_tree(
 
             active_headers = installation_headers or user_headers
 
+            logger.info("GitHub → GET /repos/%s/%s/contents/package-lock.json", owner, repo_name)
             lockfile_resp = await client.get(
                 f"https://api.github.com/repos/{owner}/{repo_name}/contents/package-lock.json",
                 headers=active_headers,
@@ -430,6 +442,12 @@ async def get_npm_dependency_tree(
                 ) """
 
             if lockfile_resp.status_code == status.HTTP_404_NOT_FOUND:
+                logger.info(
+                    "package-lock.json not found, falling back to package.json for %s/%s",
+                    owner,
+                    repo_name,
+                )
+                logger.info("GitHub → GET /repos/%s/%s/contents/package.json", owner, repo_name)
                 package_json_resp = await client.get(
                     f"https://api.github.com/repos/{owner}/{repo_name}/contents/package.json",
                     headers=active_headers,
@@ -478,7 +496,14 @@ async def get_npm_dependency_tree(
                     status_code=status.HTTP_502_BAD_GATEWAY,
                     detail="Invalid package-lock.json format",
                 )
-            return _build_npm_tree_from_lockfile(lockfile_json)
+            tree = _build_npm_tree_from_lockfile(lockfile_json)
+            logger.info(
+                "NPM dependency tree → FE: owner=%s repo=%s children=%d",
+                owner,
+                repo_name,
+                len(tree.get("children", [])),
+            )
+            return tree
 
     except httpx.RequestError as exc:
         raise HTTPException(
@@ -521,8 +546,16 @@ async def get_pypi_dependency_tree(
         timeout = httpx.Timeout(connect=10.0, read=20.0, write=20.0, pool=30.0)
         limits = httpx.Limits(max_connections=20, max_keepalive_connections=10)
         async with httpx.AsyncClient(timeout=timeout, limits=limits) as client:
+            logger.info("GitHub → fetching PyPI manifest for %s/%s", owner, repo_name)
             fetched = await manifest_utils.fetch_pypi_manifest(client, owner, repo_name, user_headers)
-            return await _build_pypi_tree_from_manifest(client, fetched.parsed)
+            tree = await _build_pypi_tree_from_manifest(client, fetched.parsed)
+            logger.info(
+                "PyPI dependency tree → FE: owner=%s repo=%s children=%d",
+                owner,
+                repo_name,
+                len(tree.get("children", [])),
+            )
+            return tree
 
     except httpx.RequestError as exc:
         raise HTTPException(

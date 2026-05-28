@@ -346,6 +346,15 @@ async def trigger_scan(
     await db.commit()
     await db.refresh(job)
 
+    logger.info(
+        "Scan job created: owner=%s repo=%s ecosystem=%s mode=%s job_id=%s",
+        owner,
+        repo_name,
+        body.ecosystem,
+        body.scan_mode,
+        job.id,
+    )
+
     # Fire-and-forget background task.
     job_runner.submit(
         run_scan_job(
@@ -360,6 +369,11 @@ async def trigger_scan(
         )
     )
 
+    logger.info(
+        "Scan trigger → FE: job_id=%s status=%s from_cache=False",
+        job.id,
+        job.status,
+    )
     return ScanTriggerResponse(job_id=job.id, status=job.status)
 
 
@@ -420,13 +434,14 @@ async def cancel_scan(
     logger.info(f"Scan job {job_id} cancelled by user {current_user.id}")
 
     if settings.static_analysis_remote_url:
+        cancel_url = f"{settings.static_analysis_remote_url.rstrip('/')}/jobs/{job_id}"
+        logger.info("Static analysis cancel → DELETE %s", cancel_url)
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
-                await client.delete(
-                    f"{settings.static_analysis_remote_url.rstrip('/')}/jobs/{job_id}"
-                )
-        except Exception:
-            pass
+                resp = await client.delete(cancel_url)
+            logger.debug("Static analysis cancel response: HTTP %s", resp.status_code)
+        except Exception as exc:
+            logger.warning("Failed to cancel static analysis job %s: %s", job_id, exc)
 
     return {"job_id": job.id, "status": job.status, "message": "Scan cancelled"}
 
@@ -754,6 +769,14 @@ async def get_scan_job_results(
         )
     ).scalars().all()
 
+    logger.debug(
+        "GET scan job results → FE: job_id=%s page=%d per_page=%d total=%d results=%d",
+        job_id,
+        page,
+        per_page,
+        total,
+        len(rows),
+    )
     return ScanJobResultsResponse(
         job_id=job_id,
         total=total,

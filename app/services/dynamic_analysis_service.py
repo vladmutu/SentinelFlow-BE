@@ -233,100 +233,131 @@ async def analyze_package_dynamically(
     if settings.dynamic_analysis_api_key:
         headers["Authorization"] = f"Bearer {settings.dynamic_analysis_api_key}"
 
-    timeout = httpx.Timeout(max(2, settings.dynamic_analysis_timeout_seconds))
-
-    logger.info(
-        "Dynamic analysis → POST %s  ecosystem=%s  package=%s@%s  sandbox=%s",
-        analyze_url,
-        ecosystem,
-        package_name,
-        package_version,
-        settings.dynamic_analysis_sandbox_type,
+    # Use a short connect timeout so a dead service is detected quickly, but a
+    # long read timeout so we wait for the full VM analysis before giving up.
+    # The MicroVMService Firecracker path can take up to vm_boot_timeout (250 s)
+    # + vm_analysis_timeout (600 s) = 850 s, so the read timeout must exceed that.
+    timeout = httpx.Timeout(
+        connect=10.0,
+        read=float(max(10, settings.dynamic_analysis_timeout_seconds)),
+        write=30.0,
+        pool=5.0,
     )
 
-    try:
-        semaphore = await _get_dynamic_semaphore()
-        async with semaphore:
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                response = await client.post(
-                    analyze_url,
-                    json=request_payload,
-                    headers=headers or None,
-                )
+    logger.info(
+        "Dynamic analysis → POST %s  sending: %s",
+        analyze_url,
+        request_payload,
+    )
 
-        if response.is_error:
-            if response.status_code == 503:
+    _MAX_CONNECT_RETRIES = 2
+    _CONNECT_RETRY_DELAY = 5.0
+
+    semaphore = await _get_dynamic_semaphore()
+
+    for attempt in range(_MAX_CONNECT_RETRIES + 1):
+        try:
+            async with semaphore:
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    response = await client.post(
+                        analyze_url,
+                        json=request_payload,
+                        headers=headers or None,
+                    )
+
+            if response.is_error:
+                if response.status_code == 503:
+                    try:
+                        body = response.json()
+                    except Exception:
+                        body = response.text
+                    logger.warning(
+                        "Dynamic analysis service not ready for %s@%s (503): %s",
+                        package_name,
+                        package_version,
+                        body,
+                    )
+                    return _make_skipped_result("service_not_ready")
+
                 try:
                     body = response.json()
                 except Exception:
                     body = response.text
-                logger.warning(
-                    "Dynamic analysis service not ready for %s@%s (503): %s",
+                logger.error(
+                    "Dynamic analysis HTTP error for %s@%s: status=%s  body=%s",
                     package_name,
                     package_version,
+                    response.status_code,
                     body,
                 )
-                return _make_skipped_result("service_not_ready")
+                return _make_partial_result("remote_http_error", detail=f"status_code={response.status_code}")
 
-            try:
-                body = response.json()
-            except Exception:
-                body = response.text
-            logger.error(
-                "Dynamic analysis HTTP error for %s@%s: status=%s  body=%s",
-                package_name,
-                package_version,
-                response.status_code,
-                body,
-            )
-            return _make_partial_result("remote_http_error", detail=f"status_code={response.status_code}")
+            payload = response.json()
+            if not isinstance(payload, dict):
+                logger.error(
+                    "Dynamic analysis returned non-dict payload for %s@%s: %r",
+                    package_name,
+                    package_version,
+                    payload,
+                )
+                return _make_partial_result("invalid_remote_payload")
 
-        payload = response.json()
-        if not isinstance(payload, dict):
-            logger.error(
-                "Dynamic analysis returned non-dict payload for %s@%s: %r",
-                package_name,
-                package_version,
-                payload,
-            )
-            result = _make_partial_result("invalid_remote_payload")
-        else:
             logger.info(
-                "Dynamic analysis completed for %s@%s: status=%s coverage=%s risk_score=%s",
+                "Dynamic analysis ← %s@%s: status=%s coverage=%s risk_score=%s vm_evasion=%s ioc_hit=%s",
                 package_name,
                 package_version,
                 payload.get("status"),
                 payload.get("coverage"),
                 payload.get("risk_score"),
+                payload.get("vm_evasion_observed"),
+                payload.get("ioc_detail", {}).get("dynamic_hit") if isinstance(payload.get("ioc_detail"), dict) else None,
             )
-            result = _normalize_remote_response(payload)
+            return _normalize_remote_response(payload)
 
-        return result
+        except httpx.ConnectError as exc:
+            last_connect_error = exc
+            if attempt < _MAX_CONNECT_RETRIES:
+                logger.warning(
+                    "Dynamic analysis: ConnectError for %s@%s (attempt %d/%d), retrying in %.0fs — %s",
+                    package_name,
+                    package_version,
+                    attempt + 1,
+                    _MAX_CONNECT_RETRIES + 1,
+                    _CONNECT_RETRY_DELAY,
+                    exc,
+                )
+                await asyncio.sleep(_CONNECT_RETRY_DELAY)
+                continue
+            logger.error(
+                "Dynamic analysis: cannot connect to %s for %s@%s after %d attempts "
+                "— is the MicroVMService running? (%s)",
+                analyze_url,
+                package_name,
+                package_version,
+                _MAX_CONNECT_RETRIES + 1,
+                exc,
+            )
+            return _make_partial_result("remote_exception", detail="ConnectError")
 
-    except httpx.ConnectError as exc:
-        logger.error(
-            "Dynamic analysis: cannot connect to %s for %s@%s — is the MicroVMService running? (%s)",
-            analyze_url,
-            package_name,
-            package_version,
-            exc,
-        )
-        return _make_partial_result("remote_exception", detail="ConnectError")
-    except httpx.TimeoutException:
-        logger.warning(
-            "Dynamic analysis timed out after %ss for %s@%s (url=%s)",
-            settings.dynamic_analysis_timeout_seconds,
-            package_name,
-            package_version,
-            analyze_url,
-        )
-        return _make_partial_result("timeout")
-    except Exception as exc:
-        logger.warning(
-            "Dynamic analysis microservice error for %s@%s: %s — %s",
-            package_name,
-            package_version,
-            exc.__class__.__name__,
-            exc,
-        )
-        return _make_partial_result("remote_exception", detail=exc.__class__.__name__)
+        except httpx.TimeoutException:
+            logger.warning(
+                "Dynamic analysis timed out after %ss for %s@%s (url=%s)",
+                settings.dynamic_analysis_timeout_seconds,
+                package_name,
+                package_version,
+                analyze_url,
+            )
+            return _make_partial_result("timeout")
+
+        except Exception as exc:
+            logger.warning(
+                "Dynamic analysis microservice error for %s@%s: %s — %s",
+                package_name,
+                package_version,
+                exc.__class__.__name__,
+                exc,
+            )
+            return _make_partial_result("remote_exception", detail=exc.__class__.__name__)
+
+    # Should not be reachable, but satisfy type checkers.
+    return _make_partial_result("remote_exception", detail="ConnectError")

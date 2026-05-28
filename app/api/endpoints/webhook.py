@@ -95,6 +95,7 @@ async def _get_installation_access_token(installation_id: int) -> str:
         "X-GitHub-Api-Version": "2022-11-28",
     }
 
+    logger.info("GitHub → POST /app/installations/%s/access_tokens (webhook)", installation_id)
     async with httpx.AsyncClient(timeout=15.0) as client:
         resp = await client.post(
             f"https://api.github.com/app/installations/{installation_id}/access_tokens",
@@ -102,10 +103,16 @@ async def _get_installation_access_token(installation_id: int) -> str:
             json={},
         )
         if resp.is_error:
+            logger.warning(
+                "Failed to create installation token for installation_id=%s: HTTP %s",
+                installation_id,
+                resp.status_code,
+            )
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
                 detail=f"Failed to create installation token: {resp.status_code}",
             )
+        logger.debug("Installation token obtained for installation_id=%s", installation_id)
         return resp.json().get("token", "")
 
 

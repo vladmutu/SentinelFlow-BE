@@ -1,4 +1,5 @@
 import logging
+import logging.config
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,12 +19,39 @@ from app.db.session import get_db
 logger = logging.getLogger(__name__)
 
 
+def _configure_app_logging() -> None:
+    """Configure application-level logging.
+
+    Sets 'app.*' loggers to INFO and attaches a StreamHandler with a
+    readable format so our service logs are always visible alongside
+    uvicorn's own access logs. Third-party HTTP/SQL noise is silenced.
+    """
+    app_log = logging.getLogger("app")
+    if not app_log.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(
+            logging.Formatter(
+                fmt="%(asctime)s [%(levelname)-8s] %(name)s: %(message)s",
+                datefmt="%H:%M:%S",
+            )
+        )
+        app_log.addHandler(handler)
+    app_log.setLevel(logging.INFO)
+    app_log.propagate = False  # don't double-print through the root logger
+
+    # Silence chatty third-party loggers
+    for noisy in ("httpx", "httpcore", "sqlalchemy.engine", "sqlalchemy.pool"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
+
 def create_app() -> FastAPI:
     """Create and configure the FastAPI application instance.
 
     Returns:
         FastAPI: Configured application with routers and middleware.
     """
+    _configure_app_logging()
+
     app = FastAPI(
         title=settings.app_name,
         debug=settings.app_debug,

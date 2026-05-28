@@ -180,7 +180,7 @@ class Settings(BaseSettings):
         alias="DYNAMIC_ANALYSIS_API_KEY",
     )
     dynamic_analysis_timeout_seconds: int = Field(
-        default=200,
+        default=900,
         alias="DYNAMIC_ANALYSIS_TIMEOUT_SECONDS",
     )
     dynamic_analysis_fail_open: bool = Field(

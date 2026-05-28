@@ -185,6 +185,20 @@ async def run_scan_job(
 
             await asyncio.gather(*(enqueue_scan_task(t.id, scan_mode) for t in tasks))
 
+        except asyncio.CancelledError:
+            logger.warning("Scan job %s cancelled (server shutdown or task cancellation)", job_id)
+            try:
+                await _set_job_status(
+                    db,
+                    job_id,
+                    "failed",
+                    error_message="interrupted by server shutdown",
+                    completed_at=datetime.now(timezone.utc),
+                )
+            except Exception:
+                logger.exception("Could not mark cancelled job %s as failed", job_id)
+            raise
+
         except Exception as exc:
             logger.exception("Scan job %s failed during orchestration", job_id)
             try:
@@ -348,6 +362,51 @@ async def _ensure_scan_workers_started() -> None:
             _scan_worker_tasks.append(worker)
 
 
+async def _worker_safety_net(task_id: UUID) -> None:
+    """Last-resort cleanup when _scan_single_package double-faults.
+
+    Uses two separate sessions so a failure in one step does not prevent
+    the other.  The goal is to ensure processed_packages is always
+    incremented so the parent job can transition to "completed".
+    """
+    job_id: UUID | None = None
+
+    try:
+        async with AsyncSessionLocal() as db:
+            now = datetime.now(timezone.utc)
+            # Mark task failed only if it is still in a non-terminal state.
+            await db.execute(
+                update(ScanTask)
+                .where(
+                    ScanTask.id == task_id,
+                    ScanTask.status.notin_(list(_TASK_TERMINAL_STATES)),
+                )
+                .values(
+                    status=_TASK_FAILED,
+                    error_message="double-fault during error handling; see server logs",
+                    updated_at=now,
+                    completed_at=now,
+                )
+            )
+            row = (
+                await db.execute(select(ScanTask.job_id).where(ScanTask.id == task_id))
+            ).scalar_one_or_none()
+            job_id = row
+            await db.commit()
+    except Exception:
+        logger.exception("Safety-net: could not mark task %s as failed", task_id)
+
+    if job_id is not None:
+        try:
+            async with AsyncSessionLocal() as db:
+                await _increment_processed_once(db, job_id, also_scanned=False)
+                await db.commit()
+        except Exception:
+            logger.exception(
+                "Safety-net: could not increment processed_packages for job %s", job_id
+            )
+
+
 async def _scan_task_worker(worker_index: int) -> None:
     assert _scan_task_queue is not None
 
@@ -359,8 +418,20 @@ async def _scan_task_worker(worker_index: int) -> None:
 
         try:
             await _scan_single_package(task_id, scan_mode)
+        except asyncio.CancelledError:
+            # Graceful shutdown — release the queue slot before propagating.
+            _scan_task_queue.task_done()
+            raise
         except Exception as exc:
-            logger.exception("Worker %s crashed processing task %s: %s", worker_index, task_id, exc)
+            logger.exception(
+                "Worker %s: unhandled exception for task %s — running safety-net update",
+                worker_index,
+                task_id,
+            )
+            # _scan_single_package has its own except block that calls _set_task_failed.
+            # If we reached here that handler also raised (double-fault).  Force-mark the
+            # task and increment the job counter so the job is not stuck as "running".
+            await _worker_safety_net(task_id)
         finally:
             _scan_task_queue.task_done()
 

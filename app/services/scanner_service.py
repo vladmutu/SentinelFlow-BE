@@ -49,6 +49,22 @@ async def analyze_package_static(
         )
     timeout = max(60, settings.static_analysis_timeout_seconds) + 30
     try:
+        request_body = {
+            "packages": [
+                {
+                    "package_uuid": task_id,
+                    "name": package_name,
+                    "version": package_version,
+                    "ecosystem": ecosystem,
+                }
+            ]
+        }
+        logger.info(
+            "Static analysis → POST %s/jobs/%s  sending: %s",
+            base_url,
+            task_id,
+            request_body,
+        )
         async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as client:
             async with client.stream(
                 "POST",
@@ -76,7 +92,17 @@ async def analyze_package_static(
                     if not line:
                         continue
                     try:
-                        return _parse_package_result_to_verdict(json.loads(line))
+                        parsed = json.loads(line)
+                        verdict = _parse_package_result_to_verdict(parsed)
+                        logger.info(
+                            "Static analysis ← %s@%s: status=%s score=%s  raw=%.300s",
+                            package_name,
+                            package_version,
+                            verdict.malware_status,
+                            verdict.malware_score,
+                            line,
+                        )
+                        return verdict
                     except (json.JSONDecodeError, ValueError):
                         logger.warning("Unparseable result line from coordinator: %.200s", line)
                         continue

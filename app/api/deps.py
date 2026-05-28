@@ -1,3 +1,4 @@
+import logging
 from uuid import UUID
 
 import httpx
@@ -10,6 +11,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.security import decode_access_token
 from app.db.session import get_db
 from app.models.user import User
+
+logger = logging.getLogger(__name__)
 
 bearer_scheme = HTTPBearer(auto_error=False)
 
@@ -75,6 +78,7 @@ async def get_current_user(
             detail="GitHub token revoked or expired",
         )
 
+    logger.debug("Validating GitHub token for user_id=%s username=%s", user_id, user.username)
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.get(
@@ -87,6 +91,7 @@ async def get_current_user(
             )
 
         if response.status_code == status.HTTP_401_UNAUTHORIZED:
+            logger.warning("GitHub token revoked or expired for user_id=%s username=%s", user_id, user.username)
             # Bonus behavior: clear stale token so future checks fail fast locally.
             user.access_token = ""
             await db.commit()
@@ -96,12 +101,18 @@ async def get_current_user(
             )
 
         if response.is_error:
+            logger.warning(
+                "GitHub token validation returned HTTP %s for user_id=%s",
+                response.status_code,
+                user_id,
+            )
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
                 detail="Failed to validate GitHub token",
             )
 
     except httpx.RequestError as exc:
+        logger.warning("GitHub API unreachable during token validation for user_id=%s: %s", user_id, exc)
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="Unable to reach GitHub API for token validation",

@@ -15,8 +15,6 @@ from app.core.security import create_access_token
 from app.db.session import get_db
 from app.models.user import User
 
-print("!!! AUTH ROUTER LOADED !!!")
-
 router = APIRouter(prefix="/api/auth", tags=["Auth"])
 logger = logging.getLogger(__name__)
 
@@ -31,6 +29,7 @@ async def get_me(current_user: User = Depends(get_current_user)) -> dict[str, st
     Returns:
         dict[str, str | None]: Public profile fields exposed to the frontend.
     """
+    logger.debug("GET /me → username=%s", current_user.username)
     return {
         "username": current_user.username,
         "email": current_user.email,
@@ -89,14 +88,11 @@ async def github_callback(
             detail="GitHub OAuth is not configured",
         )
 
-    print(f"DEBUG: Using Client ID: '{settings.github_client_id}'")
-    print(f"DEBUG: Client ID Length: {len(settings.github_client_id)}")
-    if not settings.github_client_id:
-        raise SystemExit("GITHUB_CLIENT_ID is empty; stopping server.")
+    logger.debug("GitHub OAuth callback received  code_length=%d", len(code))
 
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
-            logger.info("GitHub OAuth exchange using client_id=%s", settings.github_client_id)
+            logger.info("GitHub OAuth → POST access_token  client_id=%s", settings.github_client_id)
             try:
                 response = await client.post(
                     "https://github.com/login/oauth/access_token",
@@ -113,11 +109,12 @@ async def github_callback(
                     detail="Unable to reach GitHub OAuth endpoints",
                 ) from exc
 
-            print(f"DEBUG: GitHub Response Status: {response.status_code}")
-            print(f"DEBUG: GitHub Response Body: {response.text}")
-            print(f"DEBUG: GitHub Raw Response: {response.text}")
-
             if response.status_code != status.HTTP_200_OK:
+                logger.warning(
+                    "GitHub OAuth token exchange failed: HTTP %s  body=%s",
+                    response.status_code,
+                    response.text[:200],
+                )
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=f"GitHub Error: {response.text}",
@@ -128,8 +125,10 @@ async def github_callback(
             access_token = token_payload.get("access_token")
             if not access_token:
                 error_description = token_payload.get("error_description", "OAuth token exchange failed")
+                logger.warning("GitHub OAuth token exchange returned no access_token: %s", error_description)
                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=error_description)
 
+            logger.info("GitHub OAuth → GET /user")
             user_resp = await client.get(
                 "https://api.github.com/user",
                 headers={
@@ -140,9 +139,15 @@ async def github_callback(
             )
             user_resp.raise_for_status()
             github_user = user_resp.json()
+            logger.info(
+                "GitHub user fetched: login=%s  github_id=%s",
+                github_user.get("login"),
+                github_user.get("id"),
+            )
 
             email = github_user.get("email")
             if not email:
+                logger.info("GitHub OAuth → GET /user/emails (primary email not in profile)")
                 emails_resp = await client.get(
                     "https://api.github.com/user/emails",
                     headers={
@@ -191,6 +196,11 @@ async def github_callback(
         await db.refresh(user)
 
         jwt_token = create_access_token(subject=str(user.id))
+        logger.info(
+            "OAuth complete → redirecting user=%s (id=%s) to frontend dashboard",
+            username,
+            user.id,
+        )
         frontend_redirect = f"{settings.frontend_url}/dashboard?token={jwt_token}"
         response = RedirectResponse(url=frontend_redirect, status_code=status.HTTP_307_TEMPORARY_REDIRECT)
         response.set_cookie(
