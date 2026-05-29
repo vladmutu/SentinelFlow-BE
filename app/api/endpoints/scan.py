@@ -281,21 +281,6 @@ async def trigger_scan(
     Returns:
         ScanTriggerResponse: Identifier and initial status of the created job.
     """
-    existing_stmt = select(ScanJob).where(
-        ScanJob.owner == owner,
-        ScanJob.repo_name == repo_name,
-        ScanJob.status.in_(["pending", "running"]),
-    )
-    existing_job = (await db.execute(existing_stmt)).scalar_one_or_none()
-    if existing_job is not None:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=(
-                f"A scan is already in progress for this repository (job_id: {existing_job.id}). "
-                "Cancel it or wait for it to finish."
-            ),
-        )
-
     # For graph-tab modes: if we already have a stored source hash and a completed
     # job with that hash, return it immediately without creating a new job.
     _GRAPH_TAB_MODES = {"full", "static_enrichment", "dynamic"}
