@@ -669,13 +669,27 @@ def _should_run_dynamic_analysis(
     if not flagged:
         return False
 
+    # If the classifier itself produced the flag, reputation cannot override it.
+    # The reputation bypass only applies when the flag came from CVEs alone
+    # with no significant classifier score.
+    score_is_strong = (
+        verdict.malware_score is not None
+        and verdict.malware_score >= settings.dynamic_analysis_priority_threshold
+    )
+    if score_is_strong:
+        return True
+
     if reputation_result is not None:
         trust = reputation_result.metadata.get("trust_score", 0.0)
         if isinstance(trust, float) and trust >= 0.8 and not has_cves:
             logger.info(
-                "Skipping dynamic analysis for high-trust package with no CVEs (trust_score=%.2f)", trust
+                "Skipping dynamic analysis for high-trust package with no CVEs "
+                "(trust_score=%.2f, malware_score=%.2f)",
+                trust,
+                verdict.malware_score or 0.0,
             )
             return False
+
     return True
 
 

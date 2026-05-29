@@ -104,11 +104,16 @@ def _normalize_remote_response(payload: dict[str, object]) -> DynamicAnalysisRes
     except (TypeError, ValueError):
         risk_score = None
 
+    ioc_detail_raw = payload.get("ioc_detail")
+    ioc_hit = bool(isinstance(ioc_detail_raw, dict) and ioc_detail_raw.get("dynamic_hit"))
+
     # Capture all rich data from the microservice so it gets persisted in
     # risk_assessment.metadata.dynamic via the orchestrator's dynamic_metadata.
     metadata: dict[str, object] = {
         "status": status,
         "coverage": coverage,
+        "risk_score": risk_score,
+        "ioc_hit": ioc_hit,
         "sandbox_provider": payload.get("provider"),
         "sandbox_job_id": payload.get("job_id"),
         "sandbox_timed_out": bool(payload.get("timed_out", False)),
