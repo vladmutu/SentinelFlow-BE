@@ -1,3 +1,4 @@
+# CHANGED: cancel_scan notifies MicroVMService via DELETE /analyze/{job_id}; add _get_dynamic_job_ids_for_scan helper
 """REST endpoints for the malware-scan workflow.
 
 * ``POST /{owner}/{repo_name}/scan``      – trigger a new scan job.
@@ -364,6 +365,27 @@ async def trigger_scan(
 
 # ── Cancel ─────────────────────────────────────────────────────────────
 
+async def _get_dynamic_job_ids_for_scan(
+    job_id: UUID, db: AsyncSession
+) -> list[str]:
+    """Extract dynamic analysis job IDs stored in scan result metadata."""
+    rows = (
+        await db.execute(
+            select(ScanResult.risk_assessment).where(ScanResult.job_id == job_id)
+        )
+    ).scalars().all()
+    ids: list[str] = []
+    for ra in rows:
+        if not isinstance(ra, dict):
+            continue
+        metadata = ra.get("metadata") or {}
+        dynamic = metadata.get("dynamic") or {}
+        job_id_val = dynamic.get("sandbox_job_id")
+        if isinstance(job_id_val, str) and job_id_val:
+            ids.append(job_id_val)
+    return list(set(ids))
+
+
 @router.post(
     "/{owner}/{repo_name}/scan/{job_id}/cancel",
     status_code=status.HTTP_200_OK,
@@ -428,6 +450,31 @@ async def cancel_scan(
         except Exception as exc:
             logger.warning("Failed to cancel static analysis job %s: %s", job_id, exc)
 
+    # Notify MicroVMService to cancel any running or queued dynamic analysis job.
+    # The dynamic job_id is stored in risk_assessment.metadata.dynamic.sandbox_job_id
+    # for each ScanResult row belonging to this scan job.
+    if settings.dynamic_analysis_enabled and settings.dynamic_analysis_remote_url:
+        dynamic_job_ids = await _get_dynamic_job_ids_for_scan(job_id, db)
+        for dynamic_job_id in dynamic_job_ids:
+            cancel_url = (
+                f"{settings.dynamic_analysis_remote_url.rstrip('/')}"
+                f"/analyze/{dynamic_job_id}"
+            )
+            try:
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    resp = await client.delete(cancel_url)
+                logger.debug(
+                    "Dynamic analysis cancel response for job %s: HTTP %s",
+                    dynamic_job_id,
+                    resp.status_code,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to cancel dynamic analysis job %s: %s",
+                    dynamic_job_id,
+                    exc,
+                )
+
     return {"job_id": job.id, "status": job.status, "message": "Scan cancelled"}
 
 
@@ -443,7 +490,7 @@ async def get_latest_scan_job(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> Optional[ScanJobResponse]:
-    """Return the full job details (status, progress, timestamp, results) 
+    """Return the full job details (status, progress, timestamp, results)
     for the most recent **completed** scan.
 
     This endpoint is used by the "Latest Completed Scan Summary" panel
@@ -456,7 +503,7 @@ async def get_latest_scan_job(
         db: Active asynchronous database session.
 
     Returns:
-        ScanJobResponse | None: Full job with metadata and results, or None 
+        ScanJobResponse | None: Full job with metadata and results, or None
             if no completed scan exists.
     """
     # Find the latest completed job for this repo.

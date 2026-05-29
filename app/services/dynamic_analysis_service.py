@@ -1,3 +1,4 @@
+# CHANGED: Replace blocking POST /analyze with async submit+poll loop; 5-second poll interval; 429 handling
 """Dynamic-analysis microservice integration.
 
 Delegates all dynamic analysis to a remote microservice.
@@ -9,6 +10,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 import logging
+import time
 from urllib.parse import urlparse
 
 import httpx
@@ -197,16 +199,25 @@ async def analyze_package_dynamically(
 ) -> DynamicAnalysisResult:
     """Delegate dynamic analysis to the remote microservice.
 
+    Submits the job via POST /analyze (returns 202 immediately), then polls
+    GET /analyze/{job_id}/status every 5 seconds until the job completes,
+    fails, or the timeout expires.
+
     Never executes the package locally on the API host.
-    Sends only package metadata to POST /analyze on the microservice.
     """
     if not settings.dynamic_analysis_enabled:
-        logger.info("Dynamic analysis disabled (DYNAMIC_ANALYSIS_ENABLED=false); skipping %s@%s", package_name, package_version)
+        logger.info(
+            "Dynamic analysis disabled (DYNAMIC_ANALYSIS_ENABLED=false); skipping %s@%s",
+            package_name, package_version,
+        )
         return _make_skipped_result("disabled")
 
     base_url = settings.dynamic_analysis_remote_url.strip()
     if not base_url:
-        logger.warning("Dynamic analysis remote URL is empty (DYNAMIC_ANALYSIS_REMOTE_URL not set); skipping %s@%s", package_name, package_version)
+        logger.warning(
+            "Dynamic analysis remote URL is empty (DYNAMIC_ANALYSIS_REMOTE_URL not set); skipping %s@%s",
+            package_name, package_version,
+        )
         return _make_skipped_result("missing_remote_url")
 
     parsed = urlparse(base_url)
@@ -238,16 +249,15 @@ async def analyze_package_dynamically(
     if settings.dynamic_analysis_api_key:
         headers["Authorization"] = f"Bearer {settings.dynamic_analysis_api_key}"
 
-    # Use a short connect timeout so a dead service is detected quickly, but a
-    # long read timeout so we wait for the full VM analysis before giving up.
-    # The MicroVMService Firecracker path can take up to vm_boot_timeout (250 s)
-    # + vm_analysis_timeout (600 s) = 850 s, so the read timeout must exceed that.
-    timeout = httpx.Timeout(
-        connect=10.0,
-        read=float(max(10, settings.dynamic_analysis_timeout_seconds)),
-        write=30.0,
-        pool=5.0,
-    )
+    # Short timeouts are correct now: submit returns in <100 ms, polls return in <50 ms.
+    timeout = httpx.Timeout(connect=10.0, read=10.0, write=30.0, pool=5.0)
+
+    _MAX_CONNECT_RETRIES = 2
+    _CONNECT_RETRY_DELAY = 5.0
+
+    semaphore = await _get_dynamic_semaphore()
+
+    # ── Step 1: Submit ────────────────────────────────────────────────
 
     logger.info(
         "Dynamic analysis → POST %s  sending: %s",
@@ -255,72 +265,20 @@ async def analyze_package_dynamically(
         request_payload,
     )
 
-    _MAX_CONNECT_RETRIES = 2
-    _CONNECT_RETRY_DELAY = 5.0
-
-    semaphore = await _get_dynamic_semaphore()
+    submit_resp: httpx.Response | None = None
 
     for attempt in range(_MAX_CONNECT_RETRIES + 1):
         try:
             async with semaphore:
                 async with httpx.AsyncClient(timeout=timeout) as client:
-                    response = await client.post(
+                    submit_resp = await client.post(
                         analyze_url,
                         json=request_payload,
                         headers=headers or None,
                     )
-
-            if response.is_error:
-                if response.status_code == 503:
-                    try:
-                        body = response.json()
-                    except Exception:
-                        body = response.text
-                    logger.warning(
-                        "Dynamic analysis service not ready for %s@%s (503): %s",
-                        package_name,
-                        package_version,
-                        body,
-                    )
-                    return _make_skipped_result("service_not_ready")
-
-                try:
-                    body = response.json()
-                except Exception:
-                    body = response.text
-                logger.error(
-                    "Dynamic analysis HTTP error for %s@%s: status=%s  body=%s",
-                    package_name,
-                    package_version,
-                    response.status_code,
-                    body,
-                )
-                return _make_partial_result("remote_http_error", detail=f"status_code={response.status_code}")
-
-            payload = response.json()
-            if not isinstance(payload, dict):
-                logger.error(
-                    "Dynamic analysis returned non-dict payload for %s@%s: %r",
-                    package_name,
-                    package_version,
-                    payload,
-                )
-                return _make_partial_result("invalid_remote_payload")
-
-            logger.info(
-                "Dynamic analysis ← %s@%s: status=%s coverage=%s risk_score=%s vm_evasion=%s ioc_hit=%s",
-                package_name,
-                package_version,
-                payload.get("status"),
-                payload.get("coverage"),
-                payload.get("risk_score"),
-                payload.get("vm_evasion_observed"),
-                payload.get("ioc_detail", {}).get("dynamic_hit") if isinstance(payload.get("ioc_detail"), dict) else None,
-            )
-            return _normalize_remote_response(payload)
+            break  # success — exit retry loop
 
         except httpx.ConnectError as exc:
-            last_connect_error = exc
             if attempt < _MAX_CONNECT_RETRIES:
                 logger.warning(
                     "Dynamic analysis: ConnectError for %s@%s (attempt %d/%d), retrying in %.0fs — %s",
@@ -344,16 +302,6 @@ async def analyze_package_dynamically(
             )
             return _make_partial_result("remote_exception", detail="ConnectError")
 
-        except httpx.TimeoutException:
-            logger.warning(
-                "Dynamic analysis timed out after %ss for %s@%s (url=%s)",
-                settings.dynamic_analysis_timeout_seconds,
-                package_name,
-                package_version,
-                analyze_url,
-            )
-            return _make_partial_result("timeout")
-
         except Exception as exc:
             logger.warning(
                 "Dynamic analysis microservice error for %s@%s: %s — %s",
@@ -364,5 +312,153 @@ async def analyze_package_dynamically(
             )
             return _make_partial_result("remote_exception", detail=exc.__class__.__name__)
 
-    # Should not be reachable, but satisfy type checkers.
-    return _make_partial_result("remote_exception", detail="ConnectError")
+    if submit_resp is None:
+        return _make_partial_result("remote_exception", detail="ConnectError")
+
+    # Handle submit response status codes
+    if submit_resp.status_code == 429:
+        logger.warning(
+            "Dynamic analysis queue full for %s@%s (HTTP 429)",
+            package_name, package_version,
+        )
+        return _make_skipped_result("queue_full")
+
+    if submit_resp.status_code == 503:
+        try:
+            body = submit_resp.json()
+        except Exception:
+            body = submit_resp.text
+        logger.warning(
+            "Dynamic analysis service not ready for %s@%s (503): %s",
+            package_name, package_version, body,
+        )
+        return _make_skipped_result("service_not_ready")
+
+    if submit_resp.is_error:
+        try:
+            body = submit_resp.json()
+        except Exception:
+            body = submit_resp.text
+        logger.error(
+            "Dynamic analysis HTTP error for %s@%s: status=%s  body=%s",
+            package_name, package_version, submit_resp.status_code, body,
+        )
+        return _make_partial_result("remote_http_error", detail=f"status_code={submit_resp.status_code}")
+
+    try:
+        submit_body = submit_resp.json()
+    except Exception:
+        logger.error(
+            "Dynamic analysis submit returned non-JSON response for %s@%s",
+            package_name, package_version,
+        )
+        return _make_partial_result("invalid_remote_payload")
+
+    if not isinstance(submit_body, dict):
+        logger.error(
+            "Dynamic analysis submit returned non-dict payload for %s@%s: %r",
+            package_name, package_version, submit_body,
+        )
+        return _make_partial_result("invalid_remote_payload")
+
+    job_id = submit_body.get("job_id")
+    if not isinstance(job_id, str) or not job_id:
+        logger.error(
+            "Dynamic analysis submit response missing job_id for %s@%s: %r",
+            package_name, package_version, submit_body,
+        )
+        return _make_partial_result("invalid_remote_payload")
+
+    logger.info(
+        "Dynamic analysis job submitted for %s@%s: job_id=%s",
+        package_name, package_version, job_id,
+    )
+
+    # ── Step 2: Poll ──────────────────────────────────────────────────
+
+    poll_url = f"{base_url.rstrip('/')}/analyze/{job_id}/status"
+    deadline = time.monotonic() + settings.dynamic_analysis_timeout_seconds
+
+    while time.monotonic() < deadline:
+        await asyncio.sleep(5)
+
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                poll_resp = await client.get(poll_url, headers=headers or None)
+        except Exception as exc:
+            logger.warning(
+                "Dynamic analysis poll error for job %s (%s@%s): %s",
+                job_id, package_name, package_version, exc,
+            )
+            continue
+
+        if poll_resp.is_error:
+            logger.warning(
+                "Dynamic analysis poll HTTP error for job %s: HTTP %s",
+                job_id, poll_resp.status_code,
+            )
+            continue
+
+        try:
+            body = poll_resp.json()
+        except Exception:
+            logger.warning(
+                "Dynamic analysis poll returned non-JSON for job %s", job_id,
+            )
+            continue
+
+        job_status = body.get("status")
+        logger.debug("Dynamic analysis job %s status: %s", job_id, job_status)
+
+        if job_status == "completed":
+            result_payload = body.get("result")
+            if not isinstance(result_payload, dict):
+                logger.error(
+                    "Dynamic analysis job %s completed but result is not a dict: %r",
+                    job_id, result_payload,
+                )
+                return _make_partial_result("invalid_remote_payload")
+            logger.info(
+                "Dynamic analysis ← %s@%s (job=%s): status=%s coverage=%s "
+                "risk_score=%s vm_evasion=%s ioc_hit=%s",
+                package_name,
+                package_version,
+                job_id,
+                result_payload.get("status"),
+                result_payload.get("coverage"),
+                result_payload.get("risk_score"),
+                result_payload.get("vm_evasion_observed"),
+                result_payload.get("ioc_detail", {}).get("dynamic_hit")
+                if isinstance(result_payload.get("ioc_detail"), dict) else None,
+            )
+            return _normalize_remote_response(result_payload)
+
+        if job_status == "failed":
+            error_msg = body.get("error")
+            logger.warning(
+                "Dynamic analysis job %s failed for %s@%s: %s",
+                job_id, package_name, package_version, error_msg,
+            )
+            return _make_partial_result("remote_job_failed", detail=error_msg)
+
+        if job_status == "cancelled":
+            logger.info(
+                "Dynamic analysis job %s was cancelled for %s@%s",
+                job_id, package_name, package_version,
+            )
+            return _make_skipped_result("cancelled")
+
+        # status is "queued" or "running" — keep polling
+        logger.debug(
+            "Dynamic analysis job %s is %s for %s@%s, continuing to poll",
+            job_id, job_status, package_name, package_version,
+        )
+
+    logger.warning(
+        "Dynamic analysis timed out after %ss polling job %s for %s@%s",
+        settings.dynamic_analysis_timeout_seconds,
+        job_id,
+        package_name,
+        package_version,
+    )
+    return _make_partial_result("timeout")
