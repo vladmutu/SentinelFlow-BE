@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from uuid import UUID
-
 from pydantic import BaseModel, Field, field_validator
 
 
@@ -77,6 +75,22 @@ class AddDependencyRequest(BaseModel):
     pr_body: str | None = Field(default=None, max_length=10000)
 
 
+class PackagePrescanResult(BaseModel):
+    """Security scan result for a single package, returned inline with the PR response."""
+
+    package_name: str
+    package_version: str
+    overall_status: str
+    overall_score: float | None = None
+    advisory_references: list[str] = Field(default_factory=list)
+    cve_count: int = 0
+    static_features: dict[str, float] | None = None
+    dynamic_status: str | None = None
+    dynamic_risk_score: float | None = None
+    vm_evasion_observed: bool | None = None
+    ioc_hit: bool | None = None
+
+
 class AddDependencyResponse(BaseModel):
     """Response returned after opening a pull request."""
 
@@ -89,9 +103,9 @@ class AddDependencyResponse(BaseModel):
         default_factory=list,
         description="Typosquatting warnings for dependencies that passed but raised concerns.",
     )
-    scan_job_id: UUID | None = Field(
-        default=None,
-        description="Auto-triggered static+dynamic scan job ID, if scan was successfully enqueued.",
+    prescan_results: list[PackagePrescanResult] = Field(
+        default_factory=list,
+        description="Full-pipeline security scan results for each dependency, run before PR creation.",
     )
 
 
@@ -104,6 +118,7 @@ class TyposquatSignal(BaseModel):
     edit_distance: int | None = None
     normalized_conflict: bool = False
     reasons: list[str] = Field(default_factory=list)
+    matched_popular_package: str | None = None
 
 
 class PackageSearchResult(BaseModel):

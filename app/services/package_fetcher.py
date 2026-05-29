@@ -190,18 +190,22 @@ def _popular_typosquat_check(ecosystem: str, name: str) -> dict:
     when it resembles a popular package but is NOT that package (i.e., a bad actor
     published a name one edit away from a well-known library).
 
-    Returns the same dict shape as _typosquat_signal.
+    Also detects segment-level typosquats: packages like "generator-reactt" whose
+    individual hyphen-separated segments are close to popular names.
+
+    Returns the same dict shape as _typosquat_signal, plus matched_popular_package.
     """
     popular = _POPULAR_NPM_PACKAGES if ecosystem == "npm" else _POPULAR_PYPI_PACKAGES
     normalized = _normalize_pkg_name(name)
 
-    _empty = {
+    _empty: dict = {
         "is_suspected": False,
         "confidence": 0.0,
         "levenshtein_distance": None,
         "edit_distance": None,
         "normalized_conflict": False,
         "reasons": [],
+        "matched_popular_package": None,
     }
 
     # Name IS the popular package (exact normalized match) — never suspect it
@@ -214,18 +218,48 @@ def _popular_typosquat_check(ecosystem: str, name: str) -> dict:
                 "edit_distance": 0,
                 "normalized_conflict": False,
                 "reasons": [],
+                "matched_popular_package": None,
             }
 
-    # Find the closest popular package this name might be mimicking
+    # Full-name check: find the closest popular package this name might be mimicking
     best: dict | None = None
     best_confidence = 0.0
+    best_pkg: str | None = None
     for pkg in popular:
         signal = _typosquat_signal(name, pkg)
         if signal.get("is_suspected") and signal.get("confidence", 0.0) > best_confidence:
             best_confidence = signal["confidence"]
             best = signal
+            best_pkg = pkg
 
-    return best if best is not None else _empty
+    # Segment-level check: catch "generator-reactt", "reactt-kickoff", etc.
+    # Minimum segment length of 5 avoids false positives on common 3-4 char words
+    # (e.g. "form" is 2 edits from "cors" — meaningless). Confidence threshold of
+    # 0.75 requires distance==1 or transposition; excludes the distance-2 path (0.55).
+    scoped_name = name.lower().split("/")[-1]  # strip @scope/ prefix
+    segments = [s for s in re.split(r"[-_.]", scoped_name) if len(s) >= 5]
+    for segment in segments:
+        seg_normalized = _normalize_pkg_name(segment)
+        # Skip segments that ARE a popular package (e.g. "react" in "react-dom")
+        if any(_normalize_pkg_name(pkg) == seg_normalized for pkg in popular):
+            continue
+        for pkg in popular:
+            signal = _typosquat_signal(segment, pkg)
+            seg_confidence = signal.get("confidence", 0.0)
+            if signal.get("is_suspected") and seg_confidence >= 0.75 and seg_confidence > best_confidence:
+                best_confidence = seg_confidence
+                best_pkg = pkg
+                dist = signal.get("levenshtein_distance")
+                best = {
+                    **signal,
+                    "reasons": [
+                        f"segment '{segment}' is {dist} edit{'s' if dist != 1 else ''} away from '{pkg}'"
+                    ],
+                }
+
+    if best is not None:
+        return {**best, "matched_popular_package": best_pkg}
+    return _empty
 
 
 def _text_from_html_fragment(fragment: str) -> str:

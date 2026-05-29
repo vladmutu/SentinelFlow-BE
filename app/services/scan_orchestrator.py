@@ -31,6 +31,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.db.session import AsyncSessionLocal
 from app.models.scan import RepoPackageSource, ScanJob, ScanResult, ScanTask
+from typing import TYPE_CHECKING
+
 from app.services import (
     dynamic_analysis_service,
     manifest_utils,
@@ -38,6 +40,9 @@ from app.services import (
     scanner_service,
     vulnerability_service,
 )
+
+if TYPE_CHECKING:
+    from app.api.schemas.risk import PackageRiskAssessment
 
 logger = logging.getLogger(__name__)
 
@@ -981,3 +986,120 @@ async def _set_package_metrics(
     row.processed_packages = 0
     row.scanned_packages = 0
     await db.commit()
+
+
+# ── Inline (no-DB) pre-PR scan helpers ────────────────────────────────────────
+
+async def _analyze_package_inline(
+    package_name: str,
+    package_version: str,
+    ecosystem: str,
+) -> "PackageRiskAssessment":
+    """Run the full scan pipeline for a single package without DB persistence.
+
+    Mirrors scan_mode='full' logic: static → conditional CVE/reputation → conditional dynamic.
+    Used for synchronous pre-PR security checks.
+    """
+    from uuid import uuid4
+
+    task_id_str = str(uuid4())
+
+    # Phase 1: Static analysis
+    verdict = await scanner_service.analyze_package_static(
+        task_id_str, package_name, package_version, ecosystem
+    )
+
+    # Phase 2: Enrichment gate (same threshold as _scan_single_package)
+    static_needs_enrichment = (
+        verdict.malware_status in {"malicious", "suspicious"}
+        or (
+            verdict.malware_score is not None
+            and verdict.malware_score > settings.risk_scoring_clean_max
+        )
+    )
+
+    # Phase 3: CVE lookup (conditional)
+    if static_needs_enrichment:
+        try:
+            vulnerability_result = await vulnerability_service.lookup_package_vulnerabilities(
+                ecosystem, package_name, package_version
+            )
+        except Exception:
+            logger.warning("CVE lookup failed for %s@%s in prescan", package_name, package_version)
+            vulnerability_result = vulnerability_service.VulnerabilityLookupResult(
+                signals=[], advisory_references=[], evidence=[], metadata={"error": "lookup_failed"}
+            )
+    else:
+        vulnerability_result = vulnerability_service.VulnerabilityLookupResult(
+            signals=[], advisory_references=[], evidence=[], metadata={"skipped": True}
+        )
+
+    # Phase 4: Reputation lookup (conditional)
+    if static_needs_enrichment:
+        has_cves = len(vulnerability_result.signals) > 0
+        try:
+            reputation_result = await reputation_service.lookup_package_reputation(
+                ecosystem, package_name, package_version,
+                is_direct_dependency=True,
+                force_librariesio=has_cves,
+            )
+        except Exception:
+            logger.warning("Reputation lookup failed for %s@%s in prescan", package_name, package_version)
+            reputation_result = reputation_service.ReputationLookupResult(
+                signals=[], evidence=[], metadata={"error": "lookup_failed"}
+            )
+    else:
+        reputation_result = reputation_service.ReputationLookupResult(
+            signals=[], evidence=[], metadata={"skipped": True}
+        )
+
+    # Phase 5: Dynamic analysis (conditional)
+    run_dynamic = _should_run_dynamic_analysis(verdict, reputation_result, vulnerability_result)
+    if run_dynamic:
+        try:
+            dynamic_result = await dynamic_analysis_service.analyze_package_dynamically(
+                ecosystem, package_name, package_version
+            )
+        except Exception:
+            logger.warning("Dynamic analysis failed for %s@%s in prescan", package_name, package_version)
+            dynamic_result = dynamic_analysis_service.build_skipped_dynamic_result(
+                "error", detail="prescan dynamic analysis failed"
+            )
+    else:
+        dynamic_result = dynamic_analysis_service.build_skipped_dynamic_result(
+            "not_risky", detail="prescan: package not risky enough"
+        )
+
+    return scanner_service.build_package_risk_assessment(
+        package_name, package_version, ecosystem, verdict,
+        scan_mode="full",
+        dynamic_signals=dynamic_result.signals,
+        dynamic_evidence=dynamic_result.evidence,
+        dynamic_metadata=dynamic_result.metadata,
+        vulnerability_signals=vulnerability_result.signals,
+        advisory_references=vulnerability_result.advisory_references,
+        vulnerability_evidence=vulnerability_result.evidence,
+        vulnerability_metadata=vulnerability_result.metadata,
+        reputation_signals=reputation_result.signals,
+        reputation_evidence=reputation_result.evidence,
+        reputation_metadata=reputation_result.metadata,
+    )
+
+
+async def prescan_packages_full(
+    packages: list[tuple[str, str]],
+    ecosystem: str,
+) -> list[tuple[str, str, "PackageRiskAssessment | BaseException"]]:
+    """Run the full scan pipeline on a list of (name, version) pairs without DB persistence.
+
+    Returns a list of (name, version, result_or_exception) tuples.
+    Exceptions are captured and returned rather than raised (fail-open).
+    """
+    results = await asyncio.gather(
+        *[_analyze_package_inline(name, version, ecosystem) for name, version in packages],
+        return_exceptions=True,
+    )
+    return [
+        (name, version, result)
+        for (name, version), result in zip(packages, results)
+    ]

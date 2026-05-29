@@ -1,28 +1,25 @@
-import asyncio
 import base64
 import json
 import logging
-from uuid import UUID, uuid4
+import time as _time
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import get_current_user, get_db, require_authenticated_token
+from app.api.deps import get_current_user, require_authenticated_token
 from app.api.schemas.dependency import (
     AddDependencyRequest,
     AddDependencyResponse,
     PackageDetailsResponse,
+    PackagePrescanResult,
     PackageSearchResponse,
     PackageVersionsResponse,
 )
 from app.core.config import settings
 from app.core.github_app import get_app_jwt
-from app.models.scan import ScanJob
 from app.models.user import User
-from app.services import manifest_utils, package_fetcher, pr_creator, reputation_service, scanner_service, typosquat_guard
-from app.services.job_runner import job_runner
-from app.services.scan_orchestrator import run_scan_job
+from app.services import manifest_utils, package_fetcher, pr_creator, reputation_service, typosquat_guard
+from app.services.scan_orchestrator import prescan_packages_full
 
 router = APIRouter(tags=["Repositories"])
 logger = logging.getLogger(__name__)
@@ -574,15 +571,15 @@ async def add_dependencies_via_pr(
     repo_name: str,
     payload: AddDependencyRequest,
     current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
 ) -> AddDependencyResponse:
     """Create a pull request that adds or updates dependencies.
 
     For npm, updates both ``package.json`` and ``package-lock.json``.
     For pypi, updates ``requirements.txt``.
 
-    Validates all dependencies against typosquatting patterns before
-    creating the PR. High-confidence typosquats are blocked.
+    Runs the full security scan pipeline (static → CVE → reputation → conditional dynamic)
+    on each dependency before creating the PR. Blocks on confirmed malicious packages.
+    Returns per-package scan results in the response.
     """
     user_headers = {
         "Accept": "application/vnd.github+json",
@@ -628,25 +625,58 @@ async def add_dependencies_via_pr(
             repo_name,
         )
 
-    # Pre-PR security scan: run static analysis on each dependency in parallel.
-    # Block PR creation if any package is confirmed malicious.
+    # Pre-PR security scan: run full pipeline (static → CVE → reputation → conditional dynamic).
+    # Block PR creation if any package has overall_status == "malicious".
     # Fail-open on scanner errors so a downed scanner never blocks the workflow.
-    scan_verdicts = await asyncio.gather(
-        *[
-            scanner_service.analyze_package_static(str(uuid4()), dep.name, dep.version, payload.ecosystem)
-            for dep in payload.dependencies
-        ],
-        return_exceptions=True,
-    )
-    for dep, verdict in zip(payload.dependencies, scan_verdicts):
-        if isinstance(verdict, Exception):
-            logger.warning("Pre-PR scan error for %s: %s", dep.name, verdict)
-            continue
-        if verdict.malware_status == "malicious":
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Package '{dep.name}@{dep.version}' failed security scan (malicious). PR creation blocked.",
-            )
+    prescan_package_results: list[PackagePrescanResult] = []
+    try:
+        raw_results = await prescan_packages_full(
+            [(dep.name, dep.version) for dep in payload.dependencies],
+            payload.ecosystem,
+        )
+        for pkg_name, pkg_version, assessment in raw_results:
+            if isinstance(assessment, BaseException):
+                logger.warning("Pre-PR full scan error for %s@%s: %s", pkg_name, pkg_version, assessment)
+                prescan_package_results.append(PackagePrescanResult(
+                    package_name=pkg_name,
+                    package_version=pkg_version,
+                    overall_status="error",
+                ))
+                continue
+            if assessment.overall_status == "malicious":
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Package '{pkg_name}@{pkg_version}' failed security scan (malicious). PR creation blocked.",
+                )
+            dyn_meta = assessment.metadata.get("dynamic") if assessment.metadata else None
+            if not isinstance(dyn_meta, dict):
+                dyn_meta = {}
+            feat = assessment.metadata.get("feature_snapshot") if assessment.metadata else None
+            static_features: dict[str, float] | None = None
+            if isinstance(feat, dict):
+                static_features = {k: float(v) for k, v in feat.items() if isinstance(v, (int, float))}
+            prescan_package_results.append(PackagePrescanResult(
+                package_name=pkg_name,
+                package_version=pkg_version,
+                overall_status=assessment.overall_status,
+                overall_score=assessment.overall_score,
+                advisory_references=assessment.advisory_references,
+                cve_count=len(assessment.advisory_references),
+                static_features=static_features,
+                dynamic_status=dyn_meta.get("status"),
+                dynamic_risk_score=dyn_meta.get("risk_score"),
+                vm_evasion_observed=dyn_meta.get("vm_evasion_observed"),
+                ioc_hit=dyn_meta.get("ioc_hit"),
+            ))
+    except HTTPException:
+        raise
+    except Exception:
+        logger.warning(
+            "Pre-PR full scan failed for %s/%s, proceeding without blocking",
+            owner,
+            repo_name,
+            exc_info=True,
+        )
 
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -694,51 +724,23 @@ async def add_dependencies_via_pr(
                     idempotency_key=payload.idempotency_key,
                 )
 
-            # Auto-scan the newly added packages (static + conditional dynamic only)
-            scan_job_id: UUID | None = None
-            try:
-                scan_job = ScanJob(
-                    owner=owner,
-                    repo_name=repo_name,
-                    ecosystem=payload.ecosystem,
-                    status="pending",
-                    scan_mode="full",
-                )
-                db.add(scan_job)
-                await db.commit()
-                await db.refresh(scan_job)
-                scan_job_id = scan_job.id
-                job_runner.submit(
-                    run_scan_job(
-                        job_id=scan_job.id,
-                        owner=owner,
-                        repo=repo_name,
-                        ecosystem=payload.ecosystem,
-                        access_token=current_user.access_token,
-                        selected_packages=[dep.name for dep in payload.dependencies],
-                        scan_mode="full",
-                    )
-                )
-            except Exception:
-                logger.warning(
-                    "Failed to trigger auto-scan after PR creation for %s/%s",
-                    owner,
-                    repo_name,
-                    exc_info=True,
-                )
-
             return AddDependencyResponse(
                 pr_url=pr_result.pr_url,
                 pr_number=pr_result.pr_number,
                 branch_name=pr_result.branch_name,
                 typosquat_warnings=typosquat_warnings,
-                scan_job_id=scan_job_id,
+                prescan_results=prescan_package_results,
             )
     except httpx.RequestError as exc:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="Unable to reach GitHub API while creating dependency pull request",
         ) from exc
+
+
+_SEARCH_CACHE: dict[tuple, tuple[float, PackageSearchResponse]] = {}
+_SEARCH_CACHE_TTL = 300
+_SEARCH_CACHE_MAX = 200
 
 
 @router.get(
@@ -758,19 +760,26 @@ async def search_packages_proxy(
     """
     del authenticated_user_id
 
+    cleaned_query = q.strip()
+    if not cleaned_query:
+        return PackageSearchResponse(
+            ecosystem=ecosystem,
+            query="",
+            page=page,
+            limit=limit,
+            total=0,
+            results=[],
+            did_you_mean=None,
+        )
+
+    cache_key = (ecosystem, cleaned_query.lower(), page, limit)
+    _now = _time.monotonic()
+    _cached = _SEARCH_CACHE.get(cache_key)
+    if _cached and (_now - _cached[0]) < _SEARCH_CACHE_TTL:
+        return _cached[1]
+
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
-            cleaned_query = q.strip()
-            if not cleaned_query:
-                return PackageSearchResponse(
-                    ecosystem=ecosystem,
-                    query="",
-                    page=page,
-                    limit=limit,
-                    total=0,
-                    results=[],
-                    did_you_mean=None,
-                )
             if ecosystem == "npm":
                 results = await package_fetcher.search_npm_packages(
                     cleaned_query,
@@ -794,7 +803,7 @@ async def search_packages_proxy(
             results,
         )
 
-        return PackageSearchResponse(
+        response = PackageSearchResponse(
             ecosystem=ecosystem,
             query=cleaned_query,
             page=page,
@@ -803,6 +812,11 @@ async def search_packages_proxy(
             results=results,
             did_you_mean=suggestion,
         )
+        if response.results:
+            if len(_SEARCH_CACHE) >= _SEARCH_CACHE_MAX:
+                _SEARCH_CACHE.clear()
+            _SEARCH_CACHE[cache_key] = (_now, response)
+        return response
     except httpx.HTTPStatusError as exc:
         upstream_status = exc.response.status_code
         if upstream_status == status.HTTP_404_NOT_FOUND:
