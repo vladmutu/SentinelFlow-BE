@@ -280,6 +280,24 @@ class Settings(BaseSettings):
         alias="SBOM_LICENSE_FETCH_CONCURRENCY",
     )
 
+    # Ollama / local LLM explainability
+    ollama_enabled: bool = Field(
+        default=True,
+        alias="OLLAMA_ENABLED",
+    )
+    ollama_base_url: str = Field(
+        default="http://localhost:11434",
+        alias="OLLAMA_BASE_URL",
+    )
+    ollama_model: str = Field(
+        default="mistral",
+        alias="OLLAMA_MODEL",
+    )
+    ollama_timeout_seconds: int = Field(
+        default=120,
+        alias="OLLAMA_TIMEOUT_SECONDS",
+    )
+
 @lru_cache
 def get_settings() -> Settings:
     """Return cached application settings loaded from environment variables.
