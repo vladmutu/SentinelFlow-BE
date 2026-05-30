@@ -297,6 +297,28 @@ class Settings(BaseSettings):
         default=120,
         alias="OLLAMA_TIMEOUT_SECONDS",
     )
+    ollama_embed_model: str = Field(
+        default="nomic-embed-text",
+        alias="OLLAMA_EMBED_MODEL",
+    )
+
+    # RAG — documentation retrieval for the AI agent
+    rag_enabled: bool = Field(
+        default=True,
+        alias="RAG_ENABLED",
+    )
+    rag_docs_dir: str = Field(
+        default="docs",
+        alias="RAG_DOCS_DIR",
+    )
+    rag_persist_dir: str = Field(
+        default=".chroma_db",
+        alias="RAG_PERSIST_DIR",
+    )
+    rag_top_k: int = Field(
+        default=3,
+        alias="RAG_TOP_K",
+    )
 
 @lru_cache
 def get_settings() -> Settings:

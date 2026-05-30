@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import json
 import logging
+from collections.abc import AsyncGenerator
 
 import httpx
 
 from app.api.schemas.explain import ExplainPackageRequest, ExplainPackageResponse
 from app.core.config import settings
+from app.services.rag_service import rag_service
 
 logger = logging.getLogger(__name__)
 
@@ -104,7 +107,6 @@ def build_prompt(request: ExplainPackageRequest) -> str:
             ("monthly_downloads", "Monthly downloads"),
             ("stars",             "Stars"),
             ("forks",             "Forks"),
-            ("trust_score",       "Trust score"),
             ("package_age_days",  "Package age (days)"),
             ("maintainer_count",  "Maintainers"),
         ]
@@ -112,6 +114,13 @@ def build_prompt(request: ExplainPackageRequest) -> str:
             val = rep.get(key)
             if val is not None:
                 lines.append(f"  {label}: {val}")
+        # trust_score formatted as percentage (stored as 0.0–1.0 decimal)
+        trust_val = rep.get("trust_score")
+        if trust_val is not None:
+            try:
+                lines.append(f"  Trust score: {float(trust_val) * 100:.0f}%")
+            except (TypeError, ValueError):
+                lines.append(f"  Trust score: {trust_val}")
         lines.append("")
 
     lines.append("=== Your Explanation ===")
@@ -119,12 +128,100 @@ def build_prompt(request: ExplainPackageRequest) -> str:
     return "\n".join(lines)
 
 
-async def call_ollama(prompt: str) -> str:
-    """POST the prompt to the local Ollama generate endpoint and return the response text.
+def build_chat_prompt(
+    user_message: str,
+    history: list[dict[str, str]],
+    scan_context: dict[str, object] | None,
+    retrieved_chunks: list[str] | None = None,
+) -> str:
+    """Assemble a Mistral prompt for the free-form agent chat endpoint."""
+    lines: list[str] = []
+
+    lines.append(
+        "You are SentinelFlow Agent, an AI security assistant built into the "
+        "SentinelFlow dependency analysis platform. You can help with:\n"
+        "- General cybersecurity questions (CVEs, malware, supply chain attacks, "
+        "SAST/DAST, dependency security, best practices)\n"
+        "- Questions about SentinelFlow and how it works (static AST/entropy "
+        "classifiers, dynamic microVM Firecracker sandbox, risk scoring, package "
+        "reputation checks, SBOM generation)\n"
+        "- Interpreting scan results, package verdicts, and risk signals for the "
+        "current repository\n\n"
+        "If the user asks about something completely unrelated to software security "
+        "or this platform (e.g. cooking, sports, creative writing), politely explain "
+        "that you are a specialized security assistant and redirect to security topics."
+    )
+    lines.append("")
+
+    if retrieved_chunks:
+        lines.append("=== SentinelFlow Knowledge Base (retrieved) ===")
+        for i, chunk in enumerate(retrieved_chunks):
+            lines.append(chunk.strip())
+            if i < len(retrieved_chunks) - 1:
+                lines.append("\n---")
+        lines.append("")
+
+    if scan_context:
+        lines.append("=== Current Repository Scan Summary ===")
+        repo = scan_context.get("repo_name") or "unknown"
+        ecosystem = scan_context.get("ecosystem") or "unknown"
+        lines.append(f"Repository: {repo}  Ecosystem: {ecosystem}")
+
+        total = scan_context.get("total_packages")
+        if total is not None:
+            lines.append(f"Packages scanned: {total}")
+
+        packages = scan_context.get("packages")
+        if isinstance(packages, list) and packages:
+            lines.append("Package risk summary (highest risk first):")
+            for pkg in packages[:15]:
+                name = pkg.get("name", "?")
+                ver = pkg.get("version", "?")
+                status = pkg.get("risk_status") or pkg.get("malware_status") or "unknown"
+                score = pkg.get("risk_score")
+                score_str = f" ({score * 100:.0f}%)" if isinstance(score, float) else ""
+                lines.append(f"  {name}@{ver} — {status}{score_str}")
+        lines.append("")
+
+    if history:
+        lines.append("=== Conversation History ===")
+        for msg in history[:-1]:  # exclude the latest user message (added below)
+            role_label = "User" if msg.get("role") == "user" else "Assistant"
+            lines.append(f"{role_label}: {msg.get('content', '')}")
+        lines.append("")
+
+    lines.append(f"User: {user_message}")
+    lines.append("Assistant:")
+
+    return "\n".join(lines)
+
+
+async def build_chat_prompt_with_rag(
+    user_message: str,
+    history: list[dict[str, str]],
+    scan_context: dict[str, object] | None,
+) -> str:
+    """Retrieve relevant documentation chunks via RAG, then assemble the full prompt."""
+    chunks: list[str] = []
+    if settings.rag_enabled and settings.ollama_enabled:
+        chunks = await rag_service.retrieve(
+            query=user_message,
+            top_k=settings.rag_top_k,
+            embed_model=settings.ollama_embed_model,
+            ollama_base_url=settings.ollama_base_url,
+        )
+    return build_chat_prompt(user_message, history, scan_context, chunks)
+
+
+async def stream_ollama(prompt: str) -> AsyncGenerator[str, None]:
+    """Stream tokens from Ollama's generate endpoint.
+
+    Yields:
+        str: Individual response tokens as they arrive.
 
     Raises:
-        OllamaUnavailableError: When Ollama cannot be reached (connect error or timeout).
-        OllamaResponseError: When Ollama returns a non-2xx status or unexpected body.
+        OllamaUnavailableError: When Ollama cannot be reached.
+        OllamaResponseError: When Ollama returns a non-2xx response.
     """
     timeout = httpx.Timeout(
         connect=5.0,
@@ -136,44 +233,54 @@ async def call_ollama(prompt: str) -> str:
     payload = {
         "model": settings.ollama_model,
         "prompt": prompt,
-        "stream": False,
+        "stream": True,
     }
 
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.post(url, json=payload)
+            async with client.stream("POST", url, json=payload) as response:
+                if response.is_error:
+                    body = await response.aread()
+                    raise OllamaResponseError(
+                        f"Ollama returned HTTP {response.status_code}: {body[:200]}"
+                    )
+                async for line in response.aiter_lines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        chunk = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    token = chunk.get("response", "")
+                    if token:
+                        yield token
+                    if chunk.get("done"):
+                        return
     except (httpx.ConnectError, httpx.TimeoutException) as exc:
         raise OllamaUnavailableError(str(exc)) from exc
+    except OllamaResponseError:
+        raise
     except Exception as exc:
         raise OllamaUnavailableError(f"Unexpected error contacting Ollama: {exc}") from exc
 
-    if response.is_error:
-        raise OllamaResponseError(
-            f"Ollama returned HTTP {response.status_code}: {response.text[:200]}"
-        )
 
-    try:
-        body = response.json()
-        text: str = body["response"]
-    except Exception as exc:
-        raise OllamaResponseError(f"Could not parse Ollama response: {exc}") from exc
-
+async def explain_package(request: ExplainPackageRequest) -> ExplainPackageResponse:
+    """Build prompt, stream from Ollama, and return the full concatenated explanation."""
+    prompt = build_prompt(request)
+    tokens: list[str] = []
+    async for token in stream_ollama(prompt):
+        tokens.append(token)
+    text = "".join(tokens).strip()
     logger.info(
-        "Ollama explained %s@%s via model=%s (%d chars)",
-        "package",
-        "version",
+        "Explained %s@%s via model=%s (%d chars)",
+        request.package_name,
+        request.package_version,
         settings.ollama_model,
         len(text),
     )
-    return text
-
-
-async def explain_package(request: ExplainPackageRequest) -> ExplainPackageResponse:
-    """Build prompt, call Ollama, and return a structured explanation response."""
-    prompt = build_prompt(request)
-    text = await call_ollama(prompt)
     return ExplainPackageResponse(
-        explanation=text.strip(),
+        explanation=text,
         model=settings.ollama_model,
         package_name=request.package_name,
         package_version=request.package_version,

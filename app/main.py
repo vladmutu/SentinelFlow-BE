@@ -103,6 +103,26 @@ def create_app() -> FastAPI:
             logger.exception("Failed to clean up interrupted scan jobs on startup")
 
     @app.on_event("startup")
+    async def _startup_rag() -> None:
+        """Build or reload the RAG documentation index for the AI agent."""
+        if not settings.rag_enabled or not settings.ollama_enabled:
+            logger.info("RAG index skipped (RAG_ENABLED=%s, OLLAMA_ENABLED=%s)", settings.rag_enabled, settings.ollama_enabled)
+            return
+        try:
+            from pathlib import Path
+            from app.services.rag_service import rag_service
+            docs_dir = Path(settings.rag_docs_dir)
+            persist_dir = Path(settings.rag_persist_dir)
+            await rag_service.initialize(
+                docs_dir=docs_dir,
+                persist_dir=persist_dir,
+                embed_model=settings.ollama_embed_model,
+                ollama_base_url=settings.ollama_base_url,
+            )
+        except Exception:
+            logger.exception("RAG index initialization failed — agent will run without documentation context")
+
+    @app.on_event("startup")
     async def _startup_ngrok() -> None:
         """Optionally start an ngrok tunnel for webhook development."""
         if not settings.webhook_ngrok_enabled:

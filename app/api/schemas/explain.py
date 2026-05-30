@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -24,9 +24,23 @@ class ExplainPackageRequest(BaseModel):
 
 
 class ExplainPackageResponse(BaseModel):
-    """Plain-English explanation returned to the frontend."""
+    """Plain-English explanation returned to the frontend (non-streaming fallback)."""
 
     explanation: str
     model: str
     package_name: str
     package_version: str
+
+
+class ChatMessage(BaseModel):
+    """A single turn in the agent chat conversation."""
+
+    role: Literal["user", "assistant"]
+    content: str
+
+
+class AgentChatRequest(BaseModel):
+    """Request body for the free-form agent chat endpoint."""
+
+    messages: list[ChatMessage]
+    scan_context: dict[str, Any] | None = None

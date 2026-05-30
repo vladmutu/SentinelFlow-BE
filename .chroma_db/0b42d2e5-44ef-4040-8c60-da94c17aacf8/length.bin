@@ -1,0 +1,5 @@
+GitHub Webhook Integration
+
+SentinelFlow can auto-trigger scans when you push changes to your repository. When the GitHub App detects a push that modifies `package.json`, `requirements.txt`, `pyproject.toml`, or other manifest files, it automatically queues a scan.
+
+Auto-scan is configurable per ecosystem. Contact your SentinelFlow administrator to enable or configure webhook auto-scanning.ÿÿÿÿÿÿÿ

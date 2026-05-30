@@ -20,3 +20,5 @@ pandas==2.2.2
 esprima==4.0.1
 # Webhook development (ngrok tunneling)
 pyngrok==7.2.2
+# RAG vector store for AI agent documentation retrieval
+chromadb>=0.5.0
