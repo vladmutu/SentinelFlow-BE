@@ -439,20 +439,22 @@ async def fetch_npm_manifest(
     owner: str,
     repo: str,
     headers: dict[str, str],
+    ref: str | None = None,
 ) -> FetchedManifest:
     """Fetch ``package-lock.json`` (preferred) or ``package.json`` from GitHub.
 
     Returns a FetchedManifest with the raw content string and parsed dict.
     Raises HTTPException on failure.
     """
+    ref_param = f"?ref={ref}" if ref else ""
     lockfile_resp = await client.get(
-        f"https://api.github.com/repos/{owner}/{repo}/contents/package-lock.json",
+        f"https://api.github.com/repos/{owner}/{repo}/contents/package-lock.json{ref_param}",
         headers=headers,
     )
 
     if lockfile_resp.status_code == status.HTTP_404_NOT_FOUND:
         pkg_resp = await client.get(
-            f"https://api.github.com/repos/{owner}/{repo}/contents/package.json",
+            f"https://api.github.com/repos/{owner}/{repo}/contents/package.json{ref_param}",
             headers=headers,
         )
         if pkg_resp.status_code == status.HTTP_404_NOT_FOUND:
@@ -483,14 +485,16 @@ async def fetch_pypi_manifest(
     owner: str,
     repo: str,
     headers: dict[str, str],
+    ref: str | None = None,
 ) -> FetchedManifest:
     """Fetch ``requirements.txt`` from GitHub and return a FetchedManifest.
 
     ``parsed`` is the synthetic ``{"dependencies": {"pkg": "version", …}}`` dict.
     ``raw_content`` is the original requirements.txt text used for source hashing.
     """
+    ref_param = f"?ref={ref}" if ref else ""
     resp = await client.get(
-        f"https://api.github.com/repos/{owner}/{repo}/contents/requirements.txt",
+        f"https://api.github.com/repos/{owner}/{repo}/contents/requirements.txt{ref_param}",
         headers=headers,
     )
     if resp.status_code == status.HTTP_404_NOT_FOUND:

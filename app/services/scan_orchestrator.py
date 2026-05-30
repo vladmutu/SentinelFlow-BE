@@ -68,6 +68,7 @@ async def run_scan_job(
     selected_packages: list[str] | None = None,
     scan_mode: str = "full",
     force_rescan: bool = False,
+    ref: str | None = None,
 ) -> None:
     """Create DB-backed package tasks and enqueue them for worker execution.
 
@@ -90,14 +91,14 @@ async def run_scan_job(
                 async with asyncio.timeout(_DEP_RESOLVE_TIMEOUT):
                     async with httpx.AsyncClient(timeout=30.0) as client:
                         if ecosystem == "npm":
-                            fetched = await manifest_utils.fetch_npm_manifest(client, owner, repo, headers)
+                            fetched = await manifest_utils.fetch_npm_manifest(client, owner, repo, headers, ref=ref)
                             tree = await manifest_utils.resolve_npm_dependency_tree(client, fetched.parsed)
                             workload = manifest_utils.build_npm_scan_workload(fetched.parsed, tree)
                             packages = workload.refs
                             total_dependency_nodes = workload.total_dependency_nodes
                             total_unique_packages = workload.unique_packages
                         elif ecosystem == "pypi":
-                            fetched = await manifest_utils.fetch_pypi_manifest(client, owner, repo, headers)
+                            fetched = await manifest_utils.fetch_pypi_manifest(client, owner, repo, headers, ref=ref)
                             tree = await manifest_utils.build_pypi_dependency_tree_deep(client, fetched.parsed)
                             packages = manifest_utils.flatten_dependencies(tree)
                             total_dependency_nodes = manifest_utils.count_dependency_nodes(tree)

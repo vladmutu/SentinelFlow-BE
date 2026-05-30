@@ -233,6 +233,10 @@ class Settings(BaseSettings):
         default="npm,pypi",
         alias="WEBHOOK_AUTO_SCAN_ECOSYSTEMS",
     )
+    webhook_pr_scan_enabled: bool = Field(
+        default=True,
+        alias="WEBHOOK_PR_SCAN_ENABLED",
+    )
     webhook_ngrok_enabled: bool = Field(
         default=False,
         alias="WEBHOOK_NGROK_ENABLED",
