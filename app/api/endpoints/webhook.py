@@ -371,14 +371,6 @@ async def handle_github_webhook(
         if not owner or not repo_name:
             return WebhookResponse(status="ok", message="Missing repository identity")
 
-        default_branch = repo_data.get("default_branch", "main")
-        ref = payload.get("ref", "")
-        if ref != f"refs/heads/{default_branch}":
-            return WebhookResponse(
-                status="ok",
-                message=f"Push not on default branch ({default_branch}), skipping",
-            )
-
         commits = payload.get("commits", [])
         if not isinstance(commits, list):
             commits = []
