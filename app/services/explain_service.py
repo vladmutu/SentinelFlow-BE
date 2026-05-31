@@ -211,7 +211,7 @@ def build_chat_prompt(
         packages = scan_context.get("packages")
         if isinstance(packages, list) and packages:
             lines.append("Package risk summary (highest risk first):")
-            for pkg in packages[:15]:
+            for pkg in packages[:1]:
                 name = pkg.get("name", "?")
                 ver = pkg.get("version", "?")
                 status = pkg.get("risk_status") or pkg.get("malware_status") or "unknown"
