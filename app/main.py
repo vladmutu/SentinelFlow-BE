@@ -8,6 +8,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.endpoints.auth import router as auth_router
+from app.api.endpoints.chat_sessions import router as chat_sessions_router
 from app.api.endpoints.compatibility import router as compatibility_router
 from app.api.endpoints.explain import router as explain_router
 from app.api.endpoints.repos import router as repos_router
@@ -74,6 +75,7 @@ def create_app() -> FastAPI:
     app.include_router(compatibility_router, prefix="/api/repos")
     app.include_router(webhook_router, prefix="/api/webhooks")
     app.include_router(explain_router, prefix="/api/explain")
+    app.include_router(chat_sessions_router, prefix="/api")
 
     @app.on_event("startup")
     async def _cleanup_interrupted_jobs() -> None:

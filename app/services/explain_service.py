@@ -19,31 +19,36 @@ OFF_TOPIC_RESPONSE = (
     "cybersecurity or SentinelFlow topics."
 )
 
-_OFF_TOPIC_KEYWORDS: frozenset[str] = frozenset({
-    "recipe", "cook", "bake", "ingredient", "hamburger", "pizza", "meal",
-    "breakfast", "lunch", "dinner", "food", "cuisine",
-    "football", "soccer", "basketball", "baseball", "tennis", "sport",
-    "movie", "music", "song", "album", "artist", "band",
-    "weather", "travel", "hotel", "flight", "vacation", "tourism",
-    "joke", "poem", "story", "creative writing",
-})
 
-_SECURITY_KEYWORDS: frozenset[str] = frozenset({
-    "cve", "vulnerability", "vulnerabilit", "malware", "exploit", "sast", "dast",
-    "sbom", "dependency", "dependencies", "package", "scan", "sentinelflow",
-    "firecracker", "entropy", "ast", "supply chain", "backdoor", "trojan",
-    "ransomware", "phishing", "injection", "xss", "csrf", "authentication",
-    "authorization", "cipher", "encrypt", "decrypt", "hash", "salt",
-    "firewall", "intrusion", "pentest", "ctf", "zero-day",
-})
+async def classify_topic(message: str) -> bool:
+    """Return True if the message is related to security or SentinelFlow.
 
-
-def is_off_topic(message: str) -> bool:
-    """Return True if the message is clearly off-topic for a security assistant."""
-    lowered = message.lower()
-    has_off_topic = any(kw in lowered for kw in _OFF_TOPIC_KEYWORDS)
-    has_security = any(kw in lowered for kw in _SECURITY_KEYWORDS)
-    return has_off_topic and not has_security
+    Makes a fast, non-streaming Ollama call with a dedicated classifier prompt.
+    Fails open (returns True) so that a crashed classifier never silently drops
+    legitimate security questions.
+    """
+    prompt = (
+        "You are a strict binary topic classifier. Respond with exactly one word.\n"
+        "Reply 'yes' if the message is about: software security, cybersecurity, "
+        "vulnerabilities, CVEs, malware, package analysis, dependency scanning, "
+        "supply chain attacks, SAST, DAST, SBOM, or the SentinelFlow platform.\n"
+        "Reply 'no' for anything else — cooking, sports, weather, travel, jokes, "
+        "general coding unrelated to security, creative writing, etc.\n\n"
+        f"Message: {message}\n"
+        "Answer:"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                f"{settings.ollama_base_url}/api/generate",
+                json={"model": settings.ollama_model, "prompt": prompt, "stream": False},
+            )
+            resp.raise_for_status()
+            answer = resp.json().get("response", "no").strip().lower()
+            return answer.startswith("yes")
+    except Exception:
+        logger.warning("classify_topic failed — failing open", exc_info=True)
+        return True
 
 
 class OllamaUnavailableError(Exception):

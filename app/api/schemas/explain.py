@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Any, Literal
+from uuid import UUID
 
 from pydantic import BaseModel, Field
 
@@ -40,7 +41,13 @@ class ChatMessage(BaseModel):
 
 
 class AgentChatRequest(BaseModel):
-    """Request body for the free-form agent chat endpoint."""
+    """Request body for the free-form agent chat endpoint.
+
+    Stateless mode: omit session_id; pass full conversation in messages.
+    Persistent mode: provide session_id; messages should contain only the
+    latest user message — history is loaded from the database automatically.
+    """
 
     messages: list[ChatMessage]
+    session_id: UUID | None = None
     scan_context: dict[str, Any] | None = None

@@ -8,18 +8,21 @@ from collections.abc import AsyncGenerator
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user
 from app.api.schemas.explain import AgentChatRequest, ExplainPackageRequest
 from app.core.config import settings
+from app.db.session import get_db
 from app.models.user import User
+from app.services import chat_service
 from app.services.explain_service import (
     OFF_TOPIC_RESPONSE,
     OllamaResponseError,
     OllamaUnavailableError,
     build_chat_prompt_with_rag,
     build_prompt,
-    is_off_topic,
+    classify_topic,
     stream_ollama,
 )
 
@@ -83,11 +86,13 @@ async def explain_package_endpoint(
 async def agent_chat_endpoint(
     body: AgentChatRequest,
     current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ) -> StreamingResponse:
     """Stream an agent chat response via SSE.
 
-    Accepts a conversation history plus optional scan context.
-    The agent is constrained to cybersecurity / SentinelFlow topics.
+    Stateless mode (no session_id): history passed in request, nothing persisted.
+    Persistent mode (session_id provided): history loaded from DB, both turns saved
+    after the stream completes.
     """
     if not settings.ollama_enabled:
         raise _unavailable_error()
@@ -97,18 +102,31 @@ async def agent_chat_endpoint(
 
     latest = body.messages[-1]
 
-    if is_off_topic(latest.content):
+    # --- Pre-flight topic classification ---
+    is_security = await classify_topic(latest.content)
+    if not is_security:
         async def _refuse() -> AsyncGenerator[str, None]:
             yield f"data: {json.dumps({'token': OFF_TOPIC_RESPONSE})}\n\n"
             yield "data: [DONE]\n\n"
 
         return StreamingResponse(_refuse(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
-    history = [m.model_dump() for m in body.messages]
+    # --- Resolve conversation history ---
+    session = None
+    if body.session_id is not None:
+        session = await chat_service.get_session(db, body.session_id, current_user.id)
+        if session is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chat session not found")
+        db_messages = await chat_service.get_messages(db, session.id)
+        history = [{"role": m.role, "content": m.content} for m in db_messages]
+        history.append({"role": "user", "content": latest.content})
+    else:
+        history = [m.model_dump() for m in body.messages]
 
     logger.info(
-        "SSE chat request (%d messages) by user=%s",
-        len(body.messages),
+        "SSE chat request (%d history turns, session=%s) by user=%s",
+        len(history),
+        body.session_id,
         getattr(current_user, "username", "unknown"),
     )
 
@@ -117,4 +135,37 @@ async def agent_chat_endpoint(
         history=history,
         scan_context=body.scan_context,
     )
+
+    # --- Stream with optional persistence ---
+    if session is not None:
+        async def _persistent_stream() -> AsyncGenerator[str, None]:
+            accumulated: list[str] = []
+            try:
+                async for token in stream_ollama(prompt):
+                    accumulated.append(token)
+                    yield f"data: {json.dumps({'token': token})}\n\n"
+                yield "data: [DONE]\n\n"
+            except OllamaUnavailableError as exc:
+                logger.warning("Ollama unavailable during SSE stream: %s", exc)
+                yield f"data: {json.dumps({'error': 'Ollama not reachable. Ensure it is running locally.'})}\n\n"
+                return
+            except OllamaResponseError as exc:
+                logger.error("Ollama response error during SSE stream: %s", exc)
+                yield f"data: {json.dumps({'error': 'AI model returned an unexpected response.'})}\n\n"
+                return
+            finally:
+                if accumulated:
+                    from app.db.session import AsyncSessionLocal
+                    async with AsyncSessionLocal() as persist_db:
+                        fresh_session = await chat_service.get_session(persist_db, session.id, current_user.id)
+                        if fresh_session is not None:
+                            await chat_service.append_messages(
+                                persist_db,
+                                fresh_session,
+                                latest.content,
+                                "".join(accumulated),
+                            )
+
+        return StreamingResponse(_persistent_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
+
     return StreamingResponse(_sse_stream(prompt), media_type="text/event-stream", headers=_SSE_HEADERS)
