@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any, Literal
 from uuid import UUID
 
+
 from pydantic import BaseModel, Field
 
 
@@ -19,9 +20,10 @@ class ExplainPackageRequest(BaseModel):
     risk_status: str | None = None
     risk_score: float | None = None
     static_features: dict[str, float] | None = None
-    vulnerability_details: list[dict[str, Any]] = Field(default_factory=list)
+    vulnerability_details: list[dict[str, Any]] | None = None
     dynamic_findings: dict[str, Any] | None = None
     reputation_metadata: dict[str, Any] | None = None
+    session_id: UUID | None = None
 
 
 class ExplainPackageResponse(BaseModel):

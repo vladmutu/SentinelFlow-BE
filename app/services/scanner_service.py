@@ -489,54 +489,119 @@ def _derive_status_from_score(score: float | None) -> str:
     return "malicious"
 
 
+def _score_to_llr(score: float | None, source_weight: float) -> float:
+    """Convert a probability score in [0, 1] to a log-likelihood ratio scaled by source reliability.
+
+    Returns 0.0 when score is None — absence of data is not evidence in either direction.
+    """
+    if score is None:
+        return 0.0
+    clipped = max(1e-6, min(1.0 - 1e-6, score))
+    return math.log(clipped / (1.0 - clipped)) * source_weight
+
+
 def _compute_unified_risk_score(
     *,
     verdict: ScanVerdict,
-    static_signals: list[RiskSignal],
+    static_signals: list[RiskSignal],       # kept for API compat; not used in scoring
     vulnerability_signals: list[RiskSignal],
-    reputation_signals: list[RiskSignal],
+    reputation_signals: list[RiskSignal],   # kept for API compat; not used directly
     dynamic_signals: list[RiskSignal],
+    reputation_metadata: dict[str, Any] | None = None,
 ) -> tuple[float | None, str, dict[str, Any]]:
-    classifier_component = verdict.malware_score  # None when no classifier ran (e.g. lightweight mode) → excluded from scoring
-    static_component = _aggregate_signal_bucket(
-        [signal for signal in static_signals if signal.source == "static-analysis"]
+    malice_prior = settings.risk_scoring_malice_prior
+    log_prior = math.log(malice_prior / (1.0 - malice_prior))
+
+    # 1. Static / classifier
+    classifier_score: float | None = verdict.malware_score
+
+    # 2. Dynamic — extract all signals independently, then resolve.
+    # Separating extraction from resolution removes order-dependency: a
+    # dynamic_behavior_risk=0.0 signal after dynamic_ioc_hit=True can no
+    # longer silently zero out the IOC hit, and `is True` identity checks
+    # are replaced with truthiness so non-bool True values (e.g. int 1) work.
+    ioc_hit: bool = False
+    behavior_risk: float | None = None
+    vm_evasion_detected: bool = False
+
+    for sig in dynamic_signals:
+        if sig.name == "dynamic_ioc_hit" and sig.value:
+            ioc_hit = True
+        elif sig.name == "dynamic_behavior_risk":
+            try:
+                behavior_risk = float(sig.value)
+            except (TypeError, ValueError):
+                pass
+        elif sig.name == "vm_evasion_observed" and sig.value:
+            vm_evasion_detected = True
+
+    # ioc_hit is categorical evidence — overrides any numeric behavior score.
+    dynamic_score: float | None = 1.0 if ioc_hit else behavior_risk
+
+    # Evasion degrades dynamic weight: a sandbox-evading package that looked clean
+    # gave us weakly informative data.
+    dynamic_weight = 0.55 if vm_evasion_detected else 0.85
+
+    # 3. Vulnerability — CVSS scores are 0–10; normalise to [0, 1]
+    vuln_score: float | None = None
+    raw_cvss: list[float] = []
+
+    for sig in vulnerability_signals:
+        if sig.name == "vulnerability_detected" and sig.value is not None:
+            try:
+                raw_cvss.append(float(sig.value))
+            except (TypeError, ValueError):
+                pass
+
+    if raw_cvss:
+        vuln_score = min(max(raw_cvss) / 10.0, 1.0)
+
+    # 4. Reputation — feed (1 - trust_score) as "risk from low reputation".
+    # Supply chain attacks occur on trusted packages, so weight is capped at 0.45.
+    trust_score: float | None = reputation_metadata.get("trust_score") if reputation_metadata else None
+    reputation_risk: float | None = (
+        1.0 - min(max(float(trust_score), 0.0), 1.0)
+        if trust_score is not None else None
     )
-    vulnerability_component = _aggregate_signal_bucket(vulnerability_signals)
-    reputation_component = _aggregate_reputation_risk_bucket(reputation_signals)
-    dynamic_component = _aggregate_signal_bucket(dynamic_signals)
 
-    components: list[tuple[str, float | None, float]] = [
-        ("classifier", classifier_component, settings.risk_scoring_classifier_weight),
-        ("static", static_component, settings.risk_scoring_static_weight),
-        ("vulnerability", vulnerability_component, settings.risk_scoring_vulnerability_weight),
-        ("reputation", reputation_component, settings.risk_scoring_reputation_weight),
-        ("dynamic", dynamic_component, settings.risk_scoring_dynamic_weight),
-    ]
+    llr_static = max(0.0, _score_to_llr(classifier_score, source_weight=0.70))
+    llr_dynamic = _score_to_llr(dynamic_score, dynamic_weight)
+    llr_vuln = _score_to_llr(vuln_score, 0.50)
+    llr_rep = _score_to_llr(reputation_risk, 0.45)
 
-    numerator = 0.0
-    denominator = 0.0
-    breakdown: dict[str, Any] = {}
-    for name, component_score, factor in components:
-        clamped_factor = max(0.0, float(factor))
-        breakdown[name] = {
-            "score": component_score,
-            "weight": clamped_factor,
-        }
-        if component_score is None or clamped_factor <= 0.0:
-            continue
-        numerator += component_score * clamped_factor
-        denominator += clamped_factor
+    log_posterior = log_prior + llr_static + llr_dynamic + llr_vuln + llr_rep
+    unified_score = round(1.0 / (1.0 + math.exp(-log_posterior)), 6)
 
-    unified_score = round(numerator / denominator, 6) if denominator > 0 else None
+    data_contribution = abs(log_posterior - log_prior)
+    confidence = min(1.0, data_contribution / 8.0)
+
+    conflict = (
+        classifier_score is not None
+        and dynamic_score is not None
+        and dynamic_score != 1.0          # IOC override is not a conflict
+        and abs(classifier_score - dynamic_score) > 0.5
+    )
+
     derived_status = _derive_status_from_score(unified_score)
-    return unified_score, derived_status, {
-        "breakdown": breakdown,
+    scoring_metadata: dict[str, Any] = {
+        "method": "bayesian_llr_v1",
+        "prior": malice_prior,
+        "log_posterior": round(log_posterior, 6),
+        "confidence": round(confidence, 4),
+        "conflict": conflict,
+        "vm_evasion_detected": vm_evasion_detected,
+        "components": {
+            "static":        {"score": classifier_score, "llr": round(llr_static, 4),  "weight": 0.70},
+            "dynamic":       {"score": dynamic_score,    "llr": round(llr_dynamic, 4), "weight": dynamic_weight},
+            "vulnerability": {"score": vuln_score,       "llr": round(llr_vuln, 4),    "weight": 0.50},
+            "reputation":    {"score": reputation_risk,  "llr": round(llr_rep, 4),     "weight": 0.45},
+        },
         "thresholds": {
-            "clean_max": settings.risk_scoring_clean_max,
+            "clean_max":      settings.risk_scoring_clean_max,
             "suspicious_max": settings.risk_scoring_suspicious_max,
         },
-        "method": "weighted_deterministic_v1",
     }
+    return unified_score, derived_status, scoring_metadata
 
 
 def _format_score(value: float | None) -> str:
@@ -832,6 +897,7 @@ def build_package_risk_assessment(
         vulnerability_signals=vuln_signals,
         reputation_signals=rep_signals,
         dynamic_signals=dyn_signals,
+        reputation_metadata=reputation_metadata,
     )
     if verdict.malware_status == "error":
         unified_status = "error"
@@ -916,7 +982,7 @@ def build_package_risk_assessment(
         ecosystem=ecosystem,
         overall_status=effective_status,
         overall_score=effective_score,
-        confidence=verdict.malware_score,
+        confidence=scoring_metadata["confidence"],
         analysis_mode=_SCAN_MODE_TO_ANALYSIS_MODE.get(scan_mode, "static-classifier"),
         allowlisted=allowlisted,
         suppressed=suppressed,

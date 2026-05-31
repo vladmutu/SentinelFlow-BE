@@ -667,22 +667,29 @@ def _should_run_dynamic_analysis(
 
     has_cves = vulnerability_result is not None and len(vulnerability_result.signals) > 0
 
+    low_reputation = (
+        reputation_result is not None
+        and reputation_result.metadata.get("package_age_days", 999) < 90
+        and (reputation_result.metadata.get("monthly_downloads") or 0) < 1000
+    )
+
     flagged = (
         verdict.malware_status == "malicious"
         or (verdict.malware_score is not None and verdict.malware_score >= settings.dynamic_analysis_priority_threshold)
         or has_cves
+        or low_reputation
     )
     if not flagged:
         return False
 
-    # If the classifier itself produced the flag, reputation cannot override it.
-    # The reputation bypass only applies when the flag came from CVEs alone
-    # with no significant classifier score.
     score_is_strong = (
         verdict.malware_score is not None
         and verdict.malware_score >= settings.dynamic_analysis_priority_threshold
     )
     if score_is_strong:
+        return True
+
+    if low_reputation:
         return True
 
     if reputation_result is not None:

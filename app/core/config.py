@@ -133,6 +133,17 @@ class Settings(BaseSettings):
     )
 
     # Unified risk scoring controls
+    #
+    # bayesian_llr_v1 prior — base rate of malicious packages in the npm/PyPI ecosystem.
+    # This sets LOG_PRIOR = log(prior / (1 - prior)) ≈ -5.29 for the default 0.5 %.
+    risk_scoring_malice_prior: float = Field(
+        default=0.005,
+        alias="RISK_SCORING_MALICE_PRIOR",
+    )
+    #
+    # DEPRECATED — replaced by bayesian_llr_v1 (risk_scoring_malice_prior).
+    # These fields are kept for backward-compatibility with existing .env files
+    # and operator tooling but are no longer read by the scoring code.
     risk_scoring_classifier_weight: float = Field(
         default=0.40,
         alias="RISK_SCORING_CLASSIFIER_WEIGHT",
@@ -153,6 +164,7 @@ class Settings(BaseSettings):
         default=0.45,
         alias="RISK_SCORING_DYNAMIC_WEIGHT",
     )
+    # END DEPRECATED
     risk_scoring_clean_max: float = Field(
         default=0.40,
         alias="RISK_SCORING_CLEAN_MAX",

@@ -61,12 +61,15 @@ async def _sse_stream(prompt: str) -> AsyncGenerator[str, None]:
 async def explain_package_endpoint(
     body: ExplainPackageRequest,
     current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ) -> StreamingResponse:
     """Stream a plain-English AI explanation for a package scan verdict via SSE.
 
     Each event: `data: {"token": "..."}\\n\\n`
     Terminal event: `data: [DONE]\\n\\n`
     Error event: `data: {"error": "..."}\\n\\n`
+
+    When ``session_id`` is provided the interaction is persisted to the chat session.
     """
     if not settings.ollama_enabled:
         raise _unavailable_error()
@@ -79,6 +82,44 @@ async def explain_package_endpoint(
     )
 
     prompt = build_prompt(body)
+
+    if body.session_id is not None:
+        session = await chat_service.get_session(db, body.session_id, current_user.id)
+        if session is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chat session not found")
+
+        user_content = f"Explain {body.package_name}@{body.package_version}"
+
+        async def _persistent_explain_stream() -> AsyncGenerator[str, None]:
+            accumulated: list[str] = []
+            try:
+                async for token in stream_ollama(prompt):
+                    accumulated.append(token)
+                    yield f"data: {json.dumps({'token': token})}\n\n"
+                yield "data: [DONE]\n\n"
+            except OllamaUnavailableError as exc:
+                logger.warning("Ollama unavailable during explain SSE: %s", exc)
+                yield f"data: {json.dumps({'error': 'Ollama not reachable. Ensure it is running locally.'})}\n\n"
+                return
+            except OllamaResponseError as exc:
+                logger.error("Ollama response error during explain SSE: %s", exc)
+                yield f"data: {json.dumps({'error': 'AI model returned an unexpected response.'})}\n\n"
+                return
+            finally:
+                if accumulated:
+                    from app.db.session import AsyncSessionLocal
+                    async with AsyncSessionLocal() as persist_db:
+                        fresh_session = await chat_service.get_session(persist_db, session.id, current_user.id)
+                        if fresh_session is not None:
+                            await chat_service.append_messages(
+                                persist_db,
+                                fresh_session,
+                                user_content,
+                                "".join(accumulated),
+                            )
+
+        return StreamingResponse(_persistent_explain_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
+
     return StreamingResponse(_sse_stream(prompt), media_type="text/event-stream", headers=_SSE_HEADERS)
 
 
