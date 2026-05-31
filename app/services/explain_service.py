@@ -14,6 +14,37 @@ from app.services.rag_service import rag_service
 
 logger = logging.getLogger(__name__)
 
+OFF_TOPIC_RESPONSE = (
+    "I'm a specialized security assistant and can only help with "
+    "cybersecurity or SentinelFlow topics."
+)
+
+_OFF_TOPIC_KEYWORDS: frozenset[str] = frozenset({
+    "recipe", "cook", "bake", "ingredient", "hamburger", "pizza", "meal",
+    "breakfast", "lunch", "dinner", "food", "cuisine",
+    "football", "soccer", "basketball", "baseball", "tennis", "sport",
+    "movie", "music", "song", "album", "artist", "band",
+    "weather", "travel", "hotel", "flight", "vacation", "tourism",
+    "joke", "poem", "story", "creative writing",
+})
+
+_SECURITY_KEYWORDS: frozenset[str] = frozenset({
+    "cve", "vulnerability", "vulnerabilit", "malware", "exploit", "sast", "dast",
+    "sbom", "dependency", "dependencies", "package", "scan", "sentinelflow",
+    "firecracker", "entropy", "ast", "supply chain", "backdoor", "trojan",
+    "ransomware", "phishing", "injection", "xss", "csrf", "authentication",
+    "authorization", "cipher", "encrypt", "decrypt", "hash", "salt",
+    "firewall", "intrusion", "pentest", "ctf", "zero-day",
+})
+
+
+def is_off_topic(message: str) -> bool:
+    """Return True if the message is clearly off-topic for a security assistant."""
+    lowered = message.lower()
+    has_off_topic = any(kw in lowered for kw in _OFF_TOPIC_KEYWORDS)
+    has_security = any(kw in lowered for kw in _SECURITY_KEYWORDS)
+    return has_off_topic and not has_security
+
 
 class OllamaUnavailableError(Exception):
     """Raised when the Ollama service cannot be reached."""
@@ -138,18 +169,19 @@ def build_chat_prompt(
     lines: list[str] = []
 
     lines.append(
-        "You are SentinelFlow Agent, an AI security assistant built into the "
-        "SentinelFlow dependency analysis platform. You can help with:\n"
-        "- General cybersecurity questions (CVEs, malware, supply chain attacks, "
-        "SAST/DAST, dependency security, best practices)\n"
-        "- Questions about SentinelFlow and how it works (static AST/entropy "
-        "classifiers, dynamic microVM Firecracker sandbox, risk scoring, package "
-        "reputation checks, SBOM generation)\n"
+        "You are SentinelFlow Agent, a strictly scoped AI security assistant built "
+        "into the SentinelFlow dependency analysis platform.\n\n"
+        "You ONLY answer questions about:\n"
+        "- Cybersecurity (CVEs, malware, supply chain attacks, SAST/DAST, dependency "
+        "security, best practices)\n"
+        "- SentinelFlow platform (static AST/entropy classifiers, dynamic microVM "
+        "Firecracker sandbox, risk scoring, package reputation checks, SBOM generation)\n"
         "- Interpreting scan results, package verdicts, and risk signals for the "
         "current repository\n\n"
-        "If the user asks about something completely unrelated to software security "
-        "or this platform (e.g. cooking, sports, creative writing), politely explain "
-        "that you are a specialized security assistant and redirect to security topics."
+        "If the user's message is unrelated to software security or this platform, "
+        "you MUST refuse to answer. Do NOT provide any information on the off-topic "
+        "subject, not even a partial answer or helpful redirect. Reply only with: "
+        f'"{OFF_TOPIC_RESPONSE}"'
     )
     lines.append("")
 

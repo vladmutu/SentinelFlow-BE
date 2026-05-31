@@ -14,10 +14,12 @@ from app.api.schemas.explain import AgentChatRequest, ExplainPackageRequest
 from app.core.config import settings
 from app.models.user import User
 from app.services.explain_service import (
+    OFF_TOPIC_RESPONSE,
     OllamaResponseError,
     OllamaUnavailableError,
     build_chat_prompt_with_rag,
     build_prompt,
+    is_off_topic,
     stream_ollama,
 )
 
@@ -94,6 +96,14 @@ async def agent_chat_endpoint(
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="messages cannot be empty")
 
     latest = body.messages[-1]
+
+    if is_off_topic(latest.content):
+        async def _refuse() -> AsyncGenerator[str, None]:
+            yield f"data: {json.dumps({'token': OFF_TOPIC_RESPONSE})}\n\n"
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(_refuse(), media_type="text/event-stream", headers=_SSE_HEADERS)
+
     history = [m.model_dump() for m in body.messages]
 
     logger.info(
