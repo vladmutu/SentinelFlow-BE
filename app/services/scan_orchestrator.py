@@ -7,7 +7,10 @@ transitions happen in ``_scan_single_package``.
 Scan modes
 ----------
 Graph-tab modes (support source-hash deduplication):
-  full              static → enrichment (if suspicious/malicious) → dynamic (if still risky)
+  full              enrichment for all (CVE for every package, Libraries.io for the top-N
+                    top-level deps within the per-scan budget) + static for all → Bayesian
+                    aggregate → dynamic when the aggregate is suspicious-or-above OR the
+                    package has very low reputation → aggregate recomputed with dynamic
   static_enrichment static → enrichment (if suspicious/malicious)
   dynamic           dynamic analysis for all packages unconditionally
 
@@ -69,6 +72,7 @@ async def run_scan_job(
     scan_mode: str = "full",
     force_rescan: bool = False,
     ref: str | None = None,
+    base_ref: str | None = None,
 ) -> None:
     """Create DB-backed package tasks and enqueue them for worker execution.
 
@@ -119,6 +123,46 @@ async def run_scan_job(
                     completed_at=datetime.now(timezone.utc),
                 )
                 return
+
+            # When scanning a PR, find packages newly added or version-changed vs the base branch.
+            # These are the only packages that need scanning; existing packages are unchanged.
+            new_package_keys: set[tuple[str, str]] | None = None
+            if base_ref is not None:
+                try:
+                    async with httpx.AsyncClient(timeout=30.0) as base_client:
+                        if ecosystem == "npm":
+                            base_fetched = await manifest_utils.fetch_npm_manifest(
+                                base_client, owner, repo, headers, ref=base_ref
+                            )
+                            base_tree = await manifest_utils.resolve_npm_dependency_tree(
+                                base_client, base_fetched.parsed
+                            )
+                            base_workload = manifest_utils.build_npm_scan_workload(base_fetched.parsed, base_tree)
+                            base_refs = base_workload.refs
+                        else:
+                            base_fetched = await manifest_utils.fetch_pypi_manifest(
+                                base_client, owner, repo, headers, ref=base_ref
+                            )
+                            base_tree = await manifest_utils.build_pypi_dependency_tree_deep(
+                                base_client, base_fetched.parsed
+                            )
+                            base_refs = manifest_utils.flatten_dependencies(base_tree)
+                    base_package_keys = {(p.name.lower(), p.version) for p in base_refs}
+                    packages = [p for p in packages if (p.name.lower(), p.version) not in base_package_keys]
+                    new_package_keys = {(p.name.lower(), p.version) for p in packages}
+                    logger.info(
+                        "PR diff scan job=%s: %d newly added/changed packages (base_ref=%s)",
+                        job_id,
+                        len(packages),
+                        base_ref,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Base manifest fetch failed for base_ref=%s; falling back to full scan",
+                        base_ref,
+                        exc_info=True,
+                    )
+                    new_package_keys = None
 
             # Compute source hash for deduplication.
             source_hash = hashlib.sha256(fetched.raw_content.encode("utf-8")).hexdigest()
@@ -174,17 +218,42 @@ async def run_scan_job(
                 total_unique_packages=total_unique_packages,
             )
 
-            tasks = [
-                ScanTask(
+            # Full mode: allocate the per-scan Libraries.io budget (hard 60 req/min API
+            # limit). Impersonation candidates (popular-name matches) are always enriched
+            # by reputation_service and claim the budget first; the remainder is spent on
+            # direct (top-level) deps in manifest order. Other modes are unaffected.
+            librariesio_eligible_idx: set[int] = set()
+            if scan_mode == "full":
+                impersonation_count = sum(
+                    1 for p in packages if reputation_service.is_popular_name(ecosystem, p.name)
+                )
+                remaining = max(0, settings.librariesio_query_budget - impersonation_count)
+                for idx, p in enumerate(packages):
+                    if remaining <= 0:
+                        break
+                    meta = p.resolution if isinstance(p.resolution, dict) else {}
+                    if not meta.get("is_direct_dependency"):
+                        continue
+                    if reputation_service.is_popular_name(ecosystem, p.name):
+                        continue  # already covered by the impersonation path
+                    librariesio_eligible_idx.add(idx)
+                    remaining -= 1
+
+            tasks = []
+            for idx, pkg_ref in enumerate(packages):
+                resolution = dict(pkg_ref.resolution) if isinstance(pkg_ref.resolution, dict) else {}
+                if new_package_keys is not None:
+                    resolution["force_enrichment"] = True
+                if idx in librariesio_eligible_idx:
+                    resolution["librariesio_eligible"] = True
+                tasks.append(ScanTask(
                     job_id=job_id,
-                    package_name=ref.name,
-                    package_version=ref.version,
+                    package_name=pkg_ref.name,
+                    package_version=pkg_ref.version,
                     ecosystem=ecosystem,
                     status=_TASK_PENDING,
-                    dependency_context=ref.resolution,
-                )
-                for ref in packages
-            ]
+                    dependency_context=resolution,
+                ))
             db.add_all(tasks)
             await db.flush()
             await db.commit()
@@ -449,8 +518,9 @@ async def _scan_single_package(task_id: UUID, scan_mode: str = "full") -> None:
 
     Modes
     -----
-    full              static → enrichment (CVE+rep, if suspicious/malicious)
-                      → dynamic (if still suspicious/malicious)
+    full              static + CVE (all) + reputation (Libraries.io budget-limited) →
+                      Bayesian aggregate → dynamic if aggregate suspicious-or-above OR
+                      very low reputation → aggregate recomputed with dynamic
     static_enrichment static → enrichment (CVE+rep, if suspicious/malicious)
     dynamic           dynamic analysis unconditionally
     static            pure static analysis; no CVE, reputation, or dynamic
@@ -475,7 +545,8 @@ async def _scan_single_package(task_id: UUID, scan_mode: str = "full") -> None:
 
     # Derive execution flags from scan_mode.
     run_static = scan_mode in {"full", "static_enrichment", "static"}
-    run_conditional_enrichment = scan_mode in {"full", "static_enrichment"}
+    run_full = scan_mode == "full"
+    run_static_enrichment = scan_mode == "static_enrichment"
     run_lightweight = scan_mode == "lightweight"
     force_dynamic = scan_mode == "dynamic"
 
@@ -494,9 +565,17 @@ async def _scan_single_package(task_id: UUID, scan_mode: str = "full") -> None:
         dependency_context = getattr(task, "dependency_context", None)
         dep_ctx = dependency_context if isinstance(dependency_context, dict) else {}
         is_direct_dep = bool(dep_ctx.get("is_direct_dependency", False))
+        # force_enrichment is set for packages newly added in a PR (diff-based scan).
+        # It bypasses the static-score gate so CVE + reputation always run for new packages.
+        force_enrichment = bool(dep_ctx.get("force_enrichment", False))
+        # librariesio_eligible is set by the orchestrator for the top-N direct deps that
+        # fit within the per-scan Libraries.io budget (full mode only).
+        librariesio_eligible = bool(dep_ctx.get("librariesio_eligible", False))
 
         # ── Phase 2: Determine CVE / reputation enrichment need ───────
-        # Enrich when static result is suspicious or malicious (score > clean threshold).
+        # full + lightweight enrich every package unconditionally; static_enrichment only
+        # enriches when static flags the package suspicious/malicious; PR-new packages
+        # (force_enrichment) always enrich.
         static_needs_enrichment = (
             verdict.malware_status in {"malicious", "suspicious"}
             or (
@@ -504,8 +583,14 @@ async def _scan_single_package(task_id: UUID, scan_mode: str = "full") -> None:
                 and verdict.malware_score > settings.risk_scoring_clean_max
             )
         )
-        should_enrich_cve = run_lightweight or (run_conditional_enrichment and static_needs_enrichment)
-        should_enrich_rep = run_lightweight or (run_conditional_enrichment and static_needs_enrichment)
+        should_enrich = (
+            run_lightweight
+            or run_full
+            or force_enrichment
+            or (run_static_enrichment and static_needs_enrichment)
+        )
+        should_enrich_cve = should_enrich
+        should_enrich_rep = should_enrich
 
         # ── Phase 3: CVE lookup (OSV / NVD) ──────────────────────────
         if should_enrich_cve:
@@ -522,13 +607,20 @@ async def _scan_single_package(task_id: UUID, scan_mode: str = "full") -> None:
         # ── Phase 4: Reputation lookup (npm registry / Libraries.io) ─
         if should_enrich_rep:
             has_cves = len(vulnerability_result.signals) > 0
+            # Full mode: Libraries.io is budget-controlled by the orchestrator
+            # (librariesio_eligible). Other modes keep their existing per-package trigger.
+            # Impersonation candidates are enriched regardless via reputation_service.
+            if run_full:
+                force_librariesio = librariesio_eligible
+            else:
+                force_librariesio = run_lightweight or is_direct_dep or has_cves or force_enrichment
             try:
                 reputation_result = await reputation_service.lookup_package_reputation(
                     task.ecosystem,
                     task.package_name,
                     task.package_version,
                     is_direct_dependency=is_direct_dep,
-                    force_librariesio=run_lightweight or is_direct_dep or has_cves,
+                    force_librariesio=force_librariesio,
                 )
             except Exception:
                 logger.warning(
@@ -544,13 +636,44 @@ async def _scan_single_package(task_id: UUID, scan_mode: str = "full") -> None:
                 signals=[], evidence=[], metadata={"skipped": True}
             )
 
-        # ── Phase 5: Dynamic analysis ─────────────────────────────────
-        # Runs unconditionally for "dynamic" mode; for "full" mode runs only
-        # if the package is still suspicious/malicious after enrichment.
-        run_dynamic = force_dynamic or (
-            scan_mode == "full"
-            and _should_run_dynamic_analysis(verdict, reputation_result, vulnerability_result)
-        )
+        # ── Phase 5: Dynamic analysis (full mode = aggregate-gated) ───
+        # Build the assessment from static + CVE + reputation only — this pre-dynamic
+        # aggregate is the gate. For "full" mode dynamic runs when the aggregate is
+        # suspicious-or-above (> clean_max) or the package has very low reputation.
+        # For "dynamic" mode it always runs; other modes never run it.
+        def _build_assessment(dyn_result):
+            return scanner_service.build_package_risk_assessment(
+                task.package_name,
+                task.package_version,
+                task.ecosystem,
+                verdict,
+                scan_mode=scan_mode,
+                dependency_context=dependency_context,
+                dynamic_signals=dyn_result.signals,
+                dynamic_evidence=dyn_result.evidence,
+                dynamic_metadata=dyn_result.metadata,
+                vulnerability_signals=vulnerability_result.signals,
+                advisory_references=vulnerability_result.advisory_references,
+                vulnerability_evidence=vulnerability_result.evidence,
+                vulnerability_metadata=vulnerability_result.metadata,
+                reputation_signals=reputation_result.signals,
+                reputation_evidence=reputation_result.evidence,
+                reputation_metadata=reputation_result.metadata,
+            )
+
+        run_dynamic = force_dynamic
+        pre_assessment = None
+        if run_full:
+            # Pre-dynamic aggregate. The skip reason here is provisional and only kept if
+            # dynamic does not run; the score is independent of it.
+            pre_assessment = _build_assessment(
+                dynamic_analysis_service.build_skipped_dynamic_result(
+                    "not_risky",
+                    detail=f"scan_mode={scan_mode}, static_verdict={verdict.malware_status}",
+                )
+            )
+            run_dynamic = _should_run_dynamic_analysis(pre_assessment.overall_score, reputation_result)
+
         if run_dynamic:
             dynamic_result = await dynamic_analysis_service.analyze_package_dynamically(
                 task.ecosystem,
@@ -568,26 +691,16 @@ async def _scan_single_package(task_id: UUID, scan_mode: str = "full") -> None:
         if force_dynamic and not run_static:
             verdict = _derive_verdict_from_dynamic(dynamic_result)
 
-        # ── Phase 6: Build risk assessment and persist ─────────────────
+        # ── Phase 6: Build (or reuse) risk assessment and persist ─────
+        # Full mode that skipped dynamic reuses the pre-dynamic assessment (its score is
+        # final). Otherwise build with the actual dynamic outcome — this RECOMPUTES the
+        # Bayesian aggregate with the dynamic component folded in.
+        if run_full and not run_dynamic and pre_assessment is not None:
+            risk_assessment = pre_assessment
+        else:
+            risk_assessment = _build_assessment(dynamic_result)
+
         if run_static and verdict.malware_status == "error":
-            risk_assessment = scanner_service.build_package_risk_assessment(
-                task.package_name,
-                task.package_version,
-                task.ecosystem,
-                verdict,
-                scan_mode=scan_mode,
-                dependency_context=dependency_context,
-                dynamic_signals=dynamic_result.signals,
-                dynamic_evidence=dynamic_result.evidence,
-                dynamic_metadata=dynamic_result.metadata,
-                vulnerability_signals=vulnerability_result.signals,
-                advisory_references=vulnerability_result.advisory_references,
-                vulnerability_evidence=vulnerability_result.evidence,
-                vulnerability_metadata=vulnerability_result.metadata,
-                reputation_signals=reputation_result.signals,
-                reputation_evidence=reputation_result.evidence,
-                reputation_metadata=reputation_result.metadata,
-            )
             await _set_task_failed(
                 task_id,
                 verdict.error_message or "Classifier returned error",
@@ -596,24 +709,6 @@ async def _scan_single_package(task_id: UUID, scan_mode: str = "full") -> None:
             )
             return
 
-        risk_assessment = scanner_service.build_package_risk_assessment(
-            task.package_name,
-            task.package_version,
-            task.ecosystem,
-            verdict,
-            scan_mode=scan_mode,
-            dependency_context=dependency_context,
-            dynamic_signals=dynamic_result.signals,
-            dynamic_evidence=dynamic_result.evidence,
-            dynamic_metadata=dynamic_result.metadata,
-            vulnerability_signals=vulnerability_result.signals,
-            advisory_references=vulnerability_result.advisory_references,
-            vulnerability_evidence=vulnerability_result.evidence,
-            vulnerability_metadata=vulnerability_result.metadata,
-            reputation_signals=reputation_result.signals,
-            reputation_evidence=reputation_result.evidence,
-            reputation_metadata=reputation_result.metadata,
-        )
         await _set_task_done(task_id, verdict, risk_assessment=risk_assessment, also_scanned=True)
 
     except Exception as exc:
@@ -654,56 +749,50 @@ def _derive_verdict_from_dynamic(
     return scanner_service.ScanVerdict(malware_status="unknown", malware_score=None)
 
 
-DYNAMIC_ANALYSIS_SCORE_THRESHOLD = 0.55
+def _is_very_low_reputation(
+    reputation_result: reputation_service.ReputationLookupResult | None,
+) -> bool:
+    """Return True if a package has *very low* reputation.
+
+    Triggers on EITHER signal:
+      - a young, barely-used package (age < 90 days AND monthly downloads < 1000), or
+      - a composite trust_score at/below ``risk_scoring_very_low_trust``.
+    """
+    if reputation_result is None:
+        return False
+    meta = reputation_result.metadata
+
+    young_and_unused = (
+        meta.get("package_age_days", 999) < 90
+        and (meta.get("monthly_downloads") or 0) < 1000
+    )
+
+    trust = meta.get("trust_score")
+    low_trust = (
+        isinstance(trust, (int, float))
+        and float(trust) <= settings.risk_scoring_very_low_trust
+    )
+
+    return young_and_unused or low_trust
 
 
 def _should_run_dynamic_analysis(
-    verdict: scanner_service.ScanVerdict,
+    pre_dynamic_score: float | None,
     reputation_result: reputation_service.ReputationLookupResult | None = None,
-    vulnerability_result: vulnerability_service.VulnerabilityLookupResult | None = None,
 ) -> bool:
+    """Decide whether a full-mode package proceeds to dynamic analysis.
+
+    Gated on the pre-dynamic Bayesian aggregate: any package scoring suspicious-or-above
+    (> ``risk_scoring_clean_max``) goes to dynamic. Very-low-reputation packages always
+    go to dynamic regardless of their aggregate score.
+    """
     if not settings.dynamic_analysis_enabled:
         return False
 
-    has_cves = vulnerability_result is not None and len(vulnerability_result.signals) > 0
-
-    low_reputation = (
-        reputation_result is not None
-        and reputation_result.metadata.get("package_age_days", 999) < 90
-        and (reputation_result.metadata.get("monthly_downloads") or 0) < 1000
-    )
-
-    flagged = (
-        verdict.malware_status == "malicious"
-        or (verdict.malware_score is not None and verdict.malware_score >= settings.dynamic_analysis_priority_threshold)
-        or has_cves
-        or low_reputation
-    )
-    if not flagged:
-        return False
-
-    score_is_strong = (
-        verdict.malware_score is not None
-        and verdict.malware_score >= settings.dynamic_analysis_priority_threshold
-    )
-    if score_is_strong:
+    if pre_dynamic_score is not None and pre_dynamic_score > settings.risk_scoring_clean_max:
         return True
 
-    if low_reputation:
-        return True
-
-    if reputation_result is not None:
-        trust = reputation_result.metadata.get("trust_score", 0.0)
-        if isinstance(trust, float) and trust >= 0.8 and not has_cves:
-            logger.info(
-                "Skipping dynamic analysis for high-trust package with no CVEs "
-                "(trust_score=%.2f, malware_score=%.2f)",
-                trust,
-                verdict.malware_score or 0.0,
-            )
-            return False
-
-    return True
+    return _is_very_low_reputation(reputation_result)
 
 
 # ── Result extraction helpers ──────────────────────────────────────────
@@ -1005,8 +1094,9 @@ async def _analyze_package_inline(
 ) -> "PackageRiskAssessment":
     """Run the full scan pipeline for a single package without DB persistence.
 
-    Mirrors scan_mode='full' logic: static → conditional CVE/reputation → conditional dynamic.
-    Used for synchronous pre-PR security checks.
+    Mirrors scan_mode='full' logic: static → CVE + reputation (always, for explicitly
+    added packages) → aggregate score → dynamic (if aggregate suspicious-or-above or very
+    low reputation) → recompute aggregate with dynamic. Used for synchronous pre-PR checks.
     """
     from uuid import uuid4
 
@@ -1017,53 +1107,53 @@ async def _analyze_package_inline(
         task_id_str, package_name, package_version, ecosystem
     )
 
-    # Phase 2: Enrichment gate (same threshold as _scan_single_package)
-    static_needs_enrichment = (
-        verdict.malware_status in {"malicious", "suspicious"}
-        or (
-            verdict.malware_score is not None
-            and verdict.malware_score > settings.risk_scoring_clean_max
+    # Phase 3: CVE lookup — always run for explicitly added packages
+    try:
+        vulnerability_result = await vulnerability_service.lookup_package_vulnerabilities(
+            ecosystem, package_name, package_version
+        )
+    except Exception:
+        logger.warning("CVE lookup failed for %s@%s in prescan", package_name, package_version)
+        vulnerability_result = vulnerability_service.VulnerabilityLookupResult(
+            signals=[], advisory_references=[], evidence=[], metadata={"error": "lookup_failed"}
+        )
+
+    # Phase 4: Reputation lookup — always run for explicitly added packages
+    try:
+        reputation_result = await reputation_service.lookup_package_reputation(
+            ecosystem, package_name, package_version,
+            is_direct_dependency=True,
+            force_librariesio=True,
+        )
+    except Exception:
+        logger.warning("Reputation lookup failed for %s@%s in prescan", package_name, package_version)
+        reputation_result = reputation_service.ReputationLookupResult(
+            signals=[], evidence=[], metadata={"error": "lookup_failed"}
+        )
+
+    def _build_assessment(dyn_result):
+        return scanner_service.build_package_risk_assessment(
+            package_name, package_version, ecosystem, verdict,
+            scan_mode="full",
+            dynamic_signals=dyn_result.signals,
+            dynamic_evidence=dyn_result.evidence,
+            dynamic_metadata=dyn_result.metadata,
+            vulnerability_signals=vulnerability_result.signals,
+            advisory_references=vulnerability_result.advisory_references,
+            vulnerability_evidence=vulnerability_result.evidence,
+            vulnerability_metadata=vulnerability_result.metadata,
+            reputation_signals=reputation_result.signals,
+            reputation_evidence=reputation_result.evidence,
+            reputation_metadata=reputation_result.metadata,
+        )
+
+    # Phase 5: Dynamic analysis — gated on the pre-dynamic aggregate score.
+    pre_assessment = _build_assessment(
+        dynamic_analysis_service.build_skipped_dynamic_result(
+            "not_risky", detail="prescan: package not risky enough"
         )
     )
-
-    # Phase 3: CVE lookup (conditional)
-    if static_needs_enrichment:
-        try:
-            vulnerability_result = await vulnerability_service.lookup_package_vulnerabilities(
-                ecosystem, package_name, package_version
-            )
-        except Exception:
-            logger.warning("CVE lookup failed for %s@%s in prescan", package_name, package_version)
-            vulnerability_result = vulnerability_service.VulnerabilityLookupResult(
-                signals=[], advisory_references=[], evidence=[], metadata={"error": "lookup_failed"}
-            )
-    else:
-        vulnerability_result = vulnerability_service.VulnerabilityLookupResult(
-            signals=[], advisory_references=[], evidence=[], metadata={"skipped": True}
-        )
-
-    # Phase 4: Reputation lookup (conditional)
-    if static_needs_enrichment:
-        has_cves = len(vulnerability_result.signals) > 0
-        try:
-            reputation_result = await reputation_service.lookup_package_reputation(
-                ecosystem, package_name, package_version,
-                is_direct_dependency=True,
-                force_librariesio=has_cves,
-            )
-        except Exception:
-            logger.warning("Reputation lookup failed for %s@%s in prescan", package_name, package_version)
-            reputation_result = reputation_service.ReputationLookupResult(
-                signals=[], evidence=[], metadata={"error": "lookup_failed"}
-            )
-    else:
-        reputation_result = reputation_service.ReputationLookupResult(
-            signals=[], evidence=[], metadata={"skipped": True}
-        )
-
-    # Phase 5: Dynamic analysis (conditional)
-    run_dynamic = _should_run_dynamic_analysis(verdict, reputation_result, vulnerability_result)
-    if run_dynamic:
+    if _should_run_dynamic_analysis(pre_assessment.overall_score, reputation_result):
         try:
             dynamic_result = await dynamic_analysis_service.analyze_package_dynamically(
                 ecosystem, package_name, package_version
@@ -1073,25 +1163,11 @@ async def _analyze_package_inline(
             dynamic_result = dynamic_analysis_service.build_skipped_dynamic_result(
                 "error", detail="prescan dynamic analysis failed"
             )
-    else:
-        dynamic_result = dynamic_analysis_service.build_skipped_dynamic_result(
-            "not_risky", detail="prescan: package not risky enough"
-        )
+        # Recompute the aggregate with the dynamic component folded in.
+        return _build_assessment(dynamic_result)
 
-    return scanner_service.build_package_risk_assessment(
-        package_name, package_version, ecosystem, verdict,
-        scan_mode="full",
-        dynamic_signals=dynamic_result.signals,
-        dynamic_evidence=dynamic_result.evidence,
-        dynamic_metadata=dynamic_result.metadata,
-        vulnerability_signals=vulnerability_result.signals,
-        advisory_references=vulnerability_result.advisory_references,
-        vulnerability_evidence=vulnerability_result.evidence,
-        vulnerability_metadata=vulnerability_result.metadata,
-        reputation_signals=reputation_result.signals,
-        reputation_evidence=reputation_result.evidence,
-        reputation_metadata=reputation_result.metadata,
-    )
+    # No dynamic ran — the pre-dynamic aggregate is final.
+    return pre_assessment
 
 
 async def prescan_packages_full(

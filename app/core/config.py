@@ -71,6 +71,13 @@ class Settings(BaseSettings):
         default="",
         alias="LIBRARIESIO_API_KEY",
     )
+    # Hard cap on Libraries.io requests per full scan (their public API allows ~60
+    # req/min). Impersonation candidates are enriched first; remaining budget goes to
+    # direct (top-level) dependencies in manifest order.
+    librariesio_query_budget: int = Field(
+        default=60,
+        alias="LIBRARIESIO_QUERY_BUDGET",
+    )
 
     # Vulnerability intelligence settings
     vulnerability_lookup_enabled: bool = Field(
@@ -172,6 +179,13 @@ class Settings(BaseSettings):
     risk_scoring_suspicious_max: float = Field(
         default=0.69,
         alias="RISK_SCORING_SUSPICIOUS_MAX",
+    )
+    # Composite trust_score (60 % downloads + 40 % stars) at/below which a package is
+    # treated as "very low reputation" and forced into dynamic analysis regardless of
+    # its aggregate score.
+    risk_scoring_very_low_trust: float = Field(
+        default=0.1,
+        alias="RISK_SCORING_VERY_LOW_TRUST",
     )
 
     # Dynamic-analysis boundary controls (remote sandbox only)

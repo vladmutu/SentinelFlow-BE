@@ -10,10 +10,12 @@ from app.api.deps import get_current_user, require_authenticated_token
 from app.api.schemas.dependency import (
     AddDependencyRequest,
     AddDependencyResponse,
+    DependencySpec,
     PackageDetailsResponse,
     PackagePrescanResult,
     PackageSearchResponse,
     PackageVersionsResponse,
+    PrescanResponse,
 )
 from app.core.config import settings
 from app.core.github_app import get_app_jwt
@@ -561,42 +563,122 @@ async def get_pypi_dependency_tree(
         ) from exc
 
 
-@router.post(
-    "/{owner}/{repo_name}/dependencies/add",
-    status_code=status.HTTP_202_ACCEPTED,
-    response_model=AddDependencyResponse,
-)
-async def add_dependencies_via_pr(
-    owner: str,
-    repo_name: str,
-    payload: AddDependencyRequest,
-    current_user: User = Depends(get_current_user),
-) -> AddDependencyResponse:
-    """Create a pull request that adds or updates dependencies.
+_PRESCAN_STATUS_EMOJI = {
+    "malicious": "🔴",
+    "suspicious": "🟠",
+    "clean": "🟢",
+    "error": "⚪",
+    "unknown": "⚪",
+}
 
-    For npm, updates both ``package.json`` and ``package-lock.json``.
-    For pypi, updates ``requirements.txt``.
 
-    Runs the full security scan pipeline (static → CVE → reputation → conditional dynamic)
-    on each dependency before creating the PR. Blocks on confirmed malicious packages.
-    Returns per-package scan results in the response.
+def _format_static_features(features: dict[str, float] | None, limit: int = 6) -> str:
+    """Render the most prominent (highest-scoring) static features as a short string."""
+    if not features:
+        return ""
+    top = sorted(
+        ((k, v) for k, v in features.items() if isinstance(v, (int, float)) and v > 0),
+        key=lambda kv: kv[1],
+        reverse=True,
+    )[:limit]
+    if not top:
+        return ""
+    parts = []
+    for k, v in top:
+        label = k.replace("_", " ")
+        val = f"{v * 100:.0f}%" if 0 <= v <= 1 else f"{v:g}"
+        parts.append(f"{label} {val}")
+    return ", ".join(parts)
+
+
+def _build_prescan_markdown(results: list[PackagePrescanResult]) -> str:
+    """Build a markdown scan summary from in-memory prescan results.
+
+    Mirrors the webhook PR-comment format (see ``webhook._build_scan_report``)
+    so the embedded PR-body summary stays consistent with the automated report,
+    then appends collapsible per-package details (CVEs, dynamic-analysis findings,
+    notable static features) so the full scan is visible inside the PR.
     """
-    user_headers = {
-        "Accept": "application/vnd.github+json",
-        "Authorization": f"Bearer {current_user.access_token}",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
+    if not results:
+        return "_No packages were analysed._"
 
-    # Typosquat validation
-    typosquat_warnings = []
-    try:
-        validations = await typosquat_guard.validate_packages(
-            payload.ecosystem,
-            payload.dependencies,
+    issues = [r for r in results if r.overall_status in {"malicious", "suspicious"}]
+    clean = [r for r in results if r.overall_status == "clean"]
+
+    header = (
+        "### SentinelFlow Dependency Scan\n\n"
+        f"**{len(results)} package(s) scanned** — "
+        f"**{len(issues)} issue(s) found**, {len(clean)} clean\n\n"
+    )
+    table_rows = [
+        "| Package | Version | Status | Risk | CVEs |",
+        "|---------|---------|--------|------|------|",
+    ]
+    for r in results:
+        emoji = _PRESCAN_STATUS_EMOJI.get(r.overall_status or "unknown", "Clean")
+        score = f"{r.overall_score:.2f}" if r.overall_score is not None else "—"
+        cves = str(r.cve_count) if r.cve_count else "—"
+        table_rows.append(
+            f"| `{r.package_name}` | `{r.package_version}` | {emoji} {r.overall_status} | {score} | {cves} |"
         )
-        blocked = [
-            v for v in validations if v.risk_level == "blocked"
-        ]
+
+    detail_blocks: list[str] = []
+    for r in results:
+        emoji = _PRESCAN_STATUS_EMOJI.get(r.overall_status or "unknown", "Clean")
+        lines: list[str] = []
+        if r.overall_score is not None:
+            lines.append(f"- **Risk score:** {r.overall_score:.2f} ({r.overall_score * 100:.0f}%)")
+        if r.advisory_references:
+            refs = ", ".join(f"`{ref}`" for ref in r.advisory_references)
+            lines.append(f"- **CVEs / advisories:** {refs}")
+        else:
+            lines.append("- **CVEs / advisories:** none")
+        if r.dynamic_status and r.dynamic_status != "skipped":
+            dyn_parts = [str(r.dynamic_status)]
+            if r.dynamic_risk_score is not None:
+                dyn_parts.append(f"risk {r.dynamic_risk_score:.2f}")
+            if r.vm_evasion_observed is not None:
+                dyn_parts.append(f"VM evasion: {'yes' if r.vm_evasion_observed else 'no'}")
+            if r.ioc_hit is not None:
+                dyn_parts.append(f"IOC hit: {'yes' if r.ioc_hit else 'no'}")
+            lines.append(f"- **Dynamic analysis:** {', '.join(dyn_parts)}")
+        else:
+            lines.append("- **Dynamic analysis:** not run (passed static/reputation gating)")
+        feats = _format_static_features(r.static_features)
+        if feats:
+            lines.append(f"- **Notable static features:** {feats}")
+
+        detail_blocks.append(
+            "<details>\n"
+            f"<summary>{emoji} <code>{r.package_name}@{r.package_version}</code> — {r.overall_status}</summary>\n\n"
+            + "\n".join(lines)
+            + "\n\n</details>"
+        )
+
+    body = header + "\n".join(table_rows)
+    if detail_blocks:
+        body += "\n\n#### Per-package details\n\n" + "\n\n".join(detail_blocks)
+    return body
+
+
+def _compose_pr_body(user_body: str | None, scan_summary_markdown: str | None) -> str | None:
+    """Combine the user-supplied PR body with the scan summary markdown."""
+    parts = [p.strip() for p in (user_body, scan_summary_markdown) if p and p.strip()]
+    if not parts:
+        return None
+    return "\n\n---\n\n".join(parts)
+
+
+async def _run_typosquat_check(
+    ecosystem: str,
+    dependencies: list[DependencySpec],
+) -> list[dict]:
+    """Run the cheap typosquat validation. Raises 400 on a blocked package,
+    returns the list of (non-blocking) warning dicts otherwise. Fails open."""
+    typosquat_warnings: list[dict] = []
+    try:
+        validations = await typosquat_guard.validate_packages(ecosystem, dependencies)
+        blocked = [v for v in validations if v.risk_level == "blocked"]
         if blocked:
             blocked_details = "; ".join(
                 f"{v.package_name}: {', '.join(v.reasons)}" for v in blocked
@@ -619,20 +701,29 @@ async def add_dependencies_via_pr(
     except HTTPException:
         raise
     except Exception:
-        logger.warning(
-            "Typosquat validation failed for %s/%s, proceeding without",
-            owner,
-            repo_name,
-        )
+        logger.warning("Typosquat validation failed, proceeding without")
+    return typosquat_warnings
 
-    # Pre-PR security scan: run full pipeline (static → CVE → reputation → conditional dynamic).
-    # Block PR creation if any package has overall_status == "malicious".
-    # Fail-open on scanner errors so a downed scanner never blocks the workflow.
+
+async def _run_dependency_prescan(
+    ecosystem: str,
+    dependencies: list[DependencySpec],
+) -> tuple[list[PackagePrescanResult], list[dict]]:
+    """Run typosquat validation + the full security pipeline (static → CVE →
+    reputation → conditional dynamic) on the dependencies **without** creating
+    a PR or persisting to the DB.
+
+    Returns ``(prescan_results, typosquat_warnings)``. Raises ``HTTPException``
+    (400) on a blocked typosquat or a confirmed malicious package. Fails open
+    (no block) if the scanner itself errors.
+    """
+    typosquat_warnings = await _run_typosquat_check(ecosystem, dependencies)
+
     prescan_package_results: list[PackagePrescanResult] = []
     try:
         raw_results = await prescan_packages_full(
-            [(dep.name, dep.version) for dep in payload.dependencies],
-            payload.ecosystem,
+            [(dep.name, dep.version) for dep in dependencies],
+            ecosystem,
         )
         for pkg_name, pkg_version, assessment in raw_results:
             if isinstance(assessment, BaseException):
@@ -671,12 +762,88 @@ async def add_dependencies_via_pr(
     except HTTPException:
         raise
     except Exception:
-        logger.warning(
-            "Pre-PR full scan failed for %s/%s, proceeding without blocking",
-            owner,
-            repo_name,
-            exc_info=True,
+        logger.warning("Pre-PR full scan failed, proceeding without blocking", exc_info=True)
+
+    return prescan_package_results, typosquat_warnings
+
+
+@router.post(
+    "/{owner}/{repo_name}/dependencies/prescan",
+    status_code=status.HTTP_200_OK,
+    response_model=PrescanResponse,
+)
+async def prescan_dependencies(
+    owner: str,
+    repo_name: str,
+    payload: AddDependencyRequest,
+    current_user: User = Depends(get_current_user),
+) -> PrescanResponse:
+    """Run the full pre-PR security scan on the requested dependencies **without**
+    creating a pull request.
+
+    This is the explicit, potentially long-running scan step. The frontend calls
+    it first, lets the user review per-package results (and Ask AI about them),
+    then calls ``/dependencies/add`` with ``run_prescan=false`` to open the PR
+    without re-scanning.
+    """
+    del owner, repo_name, current_user  # auth enforced by dependency; coords unused here
+    results, typosquat_warnings = await _run_dependency_prescan(
+        payload.ecosystem, payload.dependencies
+    )
+    return PrescanResponse(
+        prescan_results=results,
+        typosquat_warnings=typosquat_warnings,
+        scan_summary_markdown=_build_prescan_markdown(results),
+    )
+
+
+@router.post(
+    "/{owner}/{repo_name}/dependencies/add",
+    status_code=status.HTTP_202_ACCEPTED,
+    response_model=AddDependencyResponse,
+)
+async def add_dependencies_via_pr(
+    owner: str,
+    repo_name: str,
+    payload: AddDependencyRequest,
+    current_user: User = Depends(get_current_user),
+) -> AddDependencyResponse:
+    """Create a pull request that adds or updates dependencies.
+
+    For npm, updates both ``package.json`` and ``package-lock.json``.
+    For pypi, updates ``requirements.txt``.
+
+    Runs the full security scan pipeline (static → CVE → reputation → conditional dynamic)
+    on each dependency before creating the PR. Blocks on confirmed malicious packages.
+    Returns per-package scan results in the response.
+    """
+    user_headers = {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {current_user.access_token}",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+    # Security scan + typosquat. Two paths:
+    #  • run_prescan=True (default, backward-compatible): run the full pipeline now,
+    #    block on confirmed malicious, and build the summary from our own results.
+    #  • run_prescan=False (two-step flow): the client already scanned the packages
+    #    via /dependencies/prescan, so skip the heavy re-scan and only run the cheap
+    #    typosquat check; embed the client-supplied summary in the PR body.
+    if payload.run_prescan:
+        prescan_package_results, typosquat_warnings = await _run_dependency_prescan(
+            payload.ecosystem,
+            payload.dependencies,
         )
+        scan_summary_markdown = _build_prescan_markdown(prescan_package_results)
+    else:
+        prescan_package_results = []
+        typosquat_warnings = await _run_typosquat_check(
+            payload.ecosystem,
+            payload.dependencies,
+        )
+        scan_summary_markdown = payload.scan_summary_markdown
+
+    effective_pr_body = _compose_pr_body(payload.pr_body, scan_summary_markdown)
 
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -707,7 +874,7 @@ async def add_dependencies_via_pr(
                     updated_package_lock_json=payload.updated_package_lock_json,
                     preferred_branch_name=payload.branch_name,
                     pr_title=payload.pr_title,
-                    pr_body=payload.pr_body,
+                    pr_body=effective_pr_body,
                     idempotency_key=payload.idempotency_key,
                     generate_lockfile_server_side=payload.generate_lockfile_server_side,
                 )
@@ -720,7 +887,7 @@ async def add_dependencies_via_pr(
                     dependencies=payload.dependencies,
                     preferred_branch_name=payload.branch_name,
                     pr_title=payload.pr_title,
-                    pr_body=payload.pr_body,
+                    pr_body=effective_pr_body,
                     idempotency_key=payload.idempotency_key,
                 )
 

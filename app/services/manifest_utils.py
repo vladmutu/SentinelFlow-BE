@@ -432,6 +432,41 @@ def _select_matching_version(versions: list[str], spec: str | None, *, ecosystem
     return _max_version(candidates)
 
 
+def _exact_pinned_pypi_version(spec: str | None) -> str | None:
+    """Return the concrete version when ``spec`` is a single ``==x.y.z`` pin.
+
+    Returns ``None`` for ranges, compound specs (``==1.2,!=1.3``), wildcards or
+    bare names — anything where the exact installed version is not unambiguous.
+    """
+    if not spec:
+        return None
+    cleaned = spec.strip()
+    if not cleaned.startswith("=="):
+        return None
+    version = cleaned[2:].strip()
+    if not version:
+        return None
+    # Reject compound specs / wildcards: a true pin has no extra comparators.
+    if any(token in version for token in (",", " ", "*", "<", ">", "=", "!", "~")):
+        return None
+    return version
+
+
+def _pypi_spec_needs_enumeration(spec: str | None) -> bool:
+    """Whether resolving ``spec`` requires the full published-version list.
+
+    Bare names, ``latest`` and ``*`` only need the newest release; exact ``==``
+    pins already name the version. Only genuine ranges (``>=``, ``~=`` …) need
+    the heavy ``/pypi/<name>/json`` enumeration to pick the highest match.
+    """
+    if not spec:
+        return False
+    cleaned = spec.strip()
+    if cleaned in {"latest", "*"}:
+        return False
+    return _exact_pinned_pypi_version(cleaned) is None
+
+
 # ── GitHub manifest fetching ───────────────────────────────────────────
 
 async def fetch_npm_manifest(
@@ -1013,6 +1048,24 @@ async def build_pypi_dependency_tree_deep(
 
         async def _prefetch_direct(dep_name: str, dep_spec: object) -> None:
             requested_spec = _coerce_manifest_dependency_spec(dep_spec)
+
+            # Exact pins already name the version; bare/``latest`` specs only need
+            # the newest release. Neither needs the multi-MB ``/pypi/<name>/json``
+            # release history. Skip enumeration so ``_resolve_node`` resolves them
+            # via the slim ``/pypi/<name>/<version>/json`` endpoint (pin) or a
+            # single latest-metadata fetch (bare/latest) instead of the prefetch
+            # firing one full-history download per direct dependency at once.
+            pinned = _exact_pinned_pypi_version(requested_spec)
+            if pinned is not None:
+                direct_versions[dep_name] = [pinned]
+                direct_latest[dep_name] = pinned
+                return
+            if not _pypi_spec_needs_enumeration(requested_spec):
+                direct_versions[dep_name] = []
+                direct_latest[dep_name] = None
+                return
+
+            # Genuine version range: enumerate releases to pick the highest match.
             async with direct_sem:
                 try:
                     versions_resp = await package_fetcher.list_pypi_package_versions(dep_name, client=client)

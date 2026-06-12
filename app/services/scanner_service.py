@@ -803,6 +803,26 @@ def _build_policy_signals(
     if allowlisted:
         effective_score = 0.0
 
+    # Floor: popular-name impersonation warrants at least suspicious regardless of Bayesian score.
+    # The conservative 0.5% prior means the LLR model alone can't reach suspicious for this case.
+    has_impersonation = any(s.name == "popular_name_impersonation" for s in reputation_signals)
+    if has_impersonation and effective_status == "clean":
+        effective_status = "suspicious"
+        if effective_score is not None:
+            effective_score = max(effective_score, 0.41)
+        policy_signals.append(
+            RiskSignal(
+                source="policy",
+                name="impersonation_floor",
+                value=True,
+                weight=0.0,
+                confidence=0.9,
+                rationale="Package name matches well-known package with anomalously low downloads",
+                metadata={},
+            )
+        )
+        evidence.append("policy:impersonation_floor")
+
     policy_metadata.update(
         {
             "allowlisted": allowlisted,

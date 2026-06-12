@@ -297,8 +297,13 @@ async def run_pr_scan_job(
     head_sha: str,
     pr_number: int,
     check_run_id: int | None,
+    base_sha: str | None = None,
 ) -> None:
-    """Run a full scan on the PR head branch, then post check run + PR comment."""
+    """Run a diff-based scan on the PR head branch, then post check run + PR comment.
+
+    When base_sha is provided, only packages newly added or version-changed compared
+    to the base branch are scanned, with full unconditional enrichment for each.
+    """
     try:
         await run_scan_job(
             job_id=job_id,
@@ -308,6 +313,7 @@ async def run_pr_scan_job(
             access_token=access_token,
             scan_mode="full",
             ref=head_sha,
+            base_ref=base_sha or None,
         )
     finally:
         conclusion, report = await _build_scan_report(job_id)
@@ -436,6 +442,7 @@ async def handle_github_webhook(
         head = pr.get("head", {})
         base = pr.get("base", {})
         head_sha = head.get("sha", "")
+        base_sha = base.get("sha", "") or None
         pr_number = pr.get("number", 0)
 
         base_repo = base.get("repo", {})
@@ -486,6 +493,7 @@ async def handle_github_webhook(
                     head_sha=head_sha,
                     pr_number=pr_number,
                     check_run_id=check_run_id,
+                    base_sha=base_sha,
                 )
             )
             job_ids_pr.append(str(job.id))

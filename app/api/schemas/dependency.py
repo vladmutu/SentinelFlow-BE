@@ -73,6 +73,22 @@ class AddDependencyRequest(BaseModel):
     )
     pr_title: str | None = Field(default=None, max_length=200)
     pr_body: str | None = Field(default=None, max_length=10000)
+    run_prescan: bool = Field(
+        default=True,
+        description=(
+            "If true (default), the backend runs the full security scan before opening the PR "
+            "and blocks on confirmed malicious packages. Set to false when the client has already "
+            "scanned the packages via /dependencies/prescan to avoid a second long scan."
+        ),
+    )
+    scan_summary_markdown: str | None = Field(
+        default=None,
+        max_length=20000,
+        description=(
+            "Pre-built markdown scan summary (from /dependencies/prescan) to embed in the PR body. "
+            "Only used when run_prescan is false."
+        ),
+    )
 
 
 class PackagePrescanResult(BaseModel):
@@ -106,6 +122,23 @@ class AddDependencyResponse(BaseModel):
     prescan_results: list[PackagePrescanResult] = Field(
         default_factory=list,
         description="Full-pipeline security scan results for each dependency, run before PR creation.",
+    )
+
+
+class PrescanResponse(BaseModel):
+    """Response for the standalone pre-PR security scan (no PR is created)."""
+
+    prescan_results: list[PackagePrescanResult] = Field(
+        default_factory=list,
+        description="Full-pipeline security scan results for each requested dependency.",
+    )
+    typosquat_warnings: list[dict] = Field(
+        default_factory=list,
+        description="Typosquatting warnings for dependencies that passed but raised concerns.",
+    )
+    scan_summary_markdown: str = Field(
+        default="",
+        description="Markdown summary of the scan, suitable for embedding in a future PR body.",
     )
 
 

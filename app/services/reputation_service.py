@@ -17,6 +17,7 @@ import httpx
 
 from app.api.schemas.risk import RiskSignal
 from app.core.config import settings
+from app.services.typosquat_guard import _POPULAR_NPM, _POPULAR_PYPI
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +34,21 @@ _TOP_POPULARITY_THRESHOLD = 1_000_000  # monthly
 _LOW_ADOPTION_THRESHOLD = 100  # weekly
 _OLD_PACKAGE_DAYS = 730  # 2 years
 _YOUNG_PACKAGE_DAYS = 180  # 6 months
+
+# Impersonation thresholds: a real react-dom has 30M+ monthly downloads;
+# anything far below this for an exact popular-name match signals squatting.
+_IMPERSONATION_THRESHOLD_NPM = 10_000  # monthly
+_IMPERSONATION_THRESHOLD_PYPI = 5_000  # monthly
+
+
+def is_popular_name(ecosystem: str, package_name: str) -> bool:
+    """Return True if ``package_name`` exactly matches a known popular package.
+
+    Such packages are always Libraries.io-enriched (impersonation vetting) and are
+    given first claim on the per-scan Libraries.io budget by the orchestrator.
+    """
+    popular = _POPULAR_NPM if ecosystem.lower() == "npm" else _POPULAR_PYPI
+    return package_name.lower() in popular
 
 
 @dataclass(frozen=True)
@@ -210,6 +226,27 @@ async def _fetch_npm_reputation(
         ))
         evidence.append("reputation:no_repository_link")
 
+    # Popular-name impersonation: exact match to a well-known package but anomalously low downloads
+    if (
+        package_name.lower() in _POPULAR_NPM
+        and monthly_downloads is not None
+        and monthly_downloads < _IMPERSONATION_THRESHOLD_NPM
+    ):
+        signals.append(RiskSignal(
+            source="reputation",
+            name="popular_name_impersonation",
+            value=0.95,
+            weight=0.7,
+            confidence=0.9,
+            rationale=(
+                f"Package name exactly matches well-known package '{package_name}' "
+                f"but has only {monthly_downloads:,} monthly downloads — "
+                "consistent with name-squatting / impersonation"
+            ),
+            metadata={"monthly_downloads": monthly_downloads, "known_popular_name": package_name.lower()},
+        ))
+        evidence.append("reputation:popular_name_impersonation")
+
     return ReputationLookupResult(signals=signals, evidence=evidence, metadata=metadata)
 
 
@@ -369,6 +406,27 @@ async def _fetch_pypi_reputation(
         ))
         evidence.append("reputation:no_repository_link")
 
+    # Popular-name impersonation: exact match to a well-known package but anomalously low downloads
+    if (
+        package_name.lower() in _POPULAR_PYPI
+        and monthly_downloads is not None
+        and monthly_downloads < _IMPERSONATION_THRESHOLD_PYPI
+    ):
+        signals.append(RiskSignal(
+            source="reputation",
+            name="popular_name_impersonation",
+            value=0.95,
+            weight=0.7,
+            confidence=0.9,
+            rationale=(
+                f"Package name exactly matches well-known package '{package_name}' "
+                f"but has only {monthly_downloads:,} monthly downloads — "
+                "consistent with name-squatting / impersonation"
+            ),
+            metadata={"monthly_downloads": monthly_downloads, "known_popular_name": package_name.lower()},
+        ))
+        evidence.append("reputation:popular_name_impersonation")
+
     return ReputationLookupResult(signals=signals, evidence=evidence, metadata=metadata)
 
 
@@ -509,9 +567,12 @@ async def lookup_package_reputation(
                     signals=[], evidence=[], metadata={"error": f"unsupported ecosystem: {ecosystem}"}
                 )
 
-            # Enrich with Libraries.io data. Normally restricted to direct deps (60 req/min limit).
-            # force_librariesio=True bypasses this when the caller has already gated by risk score.
-            if is_direct_dependency or force_librariesio:
+            # Enrich with Libraries.io data. The 60 req/min quota is managed by the
+            # *caller* (the orchestrator allocates a per-scan budget via force_librariesio),
+            # so depth alone no longer triggers enrichment. Popular-name exact matches are
+            # always enriched regardless of depth — impersonators need vetting.
+            popular_name = is_popular_name(ecosystem, package_name)
+            if force_librariesio or popular_name:
                 try:
                     result = await _enrich_from_librariesio(client, ecosystem, package_name, result)
                 except Exception:
